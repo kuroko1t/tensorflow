@@ -7,6 +7,9 @@ import "C"
 import (
 	"log"
 )
+type Tape struct {
+	c *C.TensorTape
+}
 
 type EOp struct {
    c *C.TFE_Op
