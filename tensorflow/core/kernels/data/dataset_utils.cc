@@ -14,15 +14,30 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/kernels/data/dataset_utils.h"
+
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/graph/graph_def_builder.h"
 #include "tensorflow/core/lib/gtl/cleanup.h"
+#include "tensorflow/core/util/work_sharder.h"
 
 namespace tensorflow {
 namespace data {
 
-Status ComputeShortCircuitIndices(OpKernelContext* ctx,
+Status AsGraphDef(OpKernelContext* ctx, DatasetBase* dataset,
+                  GraphDef* graph_def) {
+  GraphDefBuilder b;
+  DatasetBase::DatasetGraphDefBuilder db(&b);
+  Node* input_node = nullptr;
+  SerializationContext serialization_ctx({});
+  TF_RETURN_IF_ERROR(
+      db.AddInputDataset(&serialization_ctx, dataset, &input_node));
+  TF_RETURN_IF_ERROR(b.ToGraphDef(graph_def));
+  return Status::OK();
+}
+
+Status ComputeShortCircuitIndices(OpKernelConstruction* ctx,
                                   const NameAttrList& func,
                                   std::vector<int>* indices) {
   FunctionLibraryRuntime::Handle fn_handle;
@@ -231,5 +246,53 @@ Status VariantTensorDataWriter::WriteTensorInternal(StringPiece key,
   return Status::OK();
 }
 
+Status AddToFunctionLibrary(FunctionLibraryDefinition* base,
+                            const FunctionLibraryDefinition& to_add) {
+  for (const auto& fn : to_add.ListFunctionNames()) {
+    if (auto found = base->Find(fn)) {
+      if (!OpDefEqual(found->signature(), to_add.Find(fn)->signature())) {
+        return errors::InvalidArgument("Cannot add function '", fn,
+                                       "' because a different function with "
+                                       "the same signature already exists.");
+      }
+      TF_RETURN_IF_ERROR(base->RemoveFunction(fn));
+    }
+  }
+  return base->AddLibrary(to_add);
+}
+
+Status AddToFunctionLibrary(FunctionLibraryDefinition* base,
+                            const FunctionDefLibrary& to_add) {
+  for (const auto& fd : to_add.function()) {
+    if (auto found = base->Find(fd.signature().name())) {
+      if (!OpDefEqual(found->signature(), fd.signature())) {
+        return errors::InvalidArgument("Cannot add function '",
+                                       fd.signature().name(),
+                                       "' because a different function with "
+                                       "the same signature already exists.");
+      }
+      TF_RETURN_IF_ERROR(base->RemoveFunction(fd.signature().name()));
+    }
+  }
+  return base->AddLibrary(to_add);
+}
+
+std::function<void(std::function<void()>)> RunnerWithMaxParallelism(
+    std::function<void(std::function<void()>)> runner, int max_parallelism) {
+  return std::bind(
+      [max_parallelism](
+          // Note: `runner` is a const reference to avoid copying it.
+          const std::function<void(std::function<void()>)>& runner,
+          std::function<void()> fn) {
+        std::function<void()> scoped_fn = std::bind(
+            [max_parallelism](const std::function<void()>& fn) {
+              ScopedPerThreadMaxParallelism scope(max_parallelism);
+              fn();
+            },
+            std::move(fn));
+        runner(std::move(scoped_fn));
+      },
+      std::move(runner), std::placeholders::_1);
+}
 }  // namespace data
 }  // namespace tensorflow

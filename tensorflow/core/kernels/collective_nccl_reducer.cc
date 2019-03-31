@@ -49,12 +49,10 @@ Status NcclReducer::InitializeCollectiveContext(CollectiveContext* col_ctx) {
       &col_ctx->device_locality);
 }
 
-Status NcclReducer::InitializeInstanceBeforeGroupDiscovery(
-    CollectiveParams* col_params) {
-  if (col_params->default_rank == 0 && col_params->group.num_tasks > 1) {
-    col_params->instance.communicator_key =
-        NcclManager::instance()->GenerateCommunicatorKey();
-  }
+Status NcclReducer::InitializeCollectiveGroupRuntimeDetails(
+    CollGroupRuntimeDetails* col_group_runtime_details) {
+  col_group_runtime_details->communicator_key =
+      NcclManager::instance()->GenerateCommunicatorKey();
   return Status::OK();
 }
 
@@ -149,11 +147,13 @@ void NcclReducer::Run(StatusCallback done) {
           << col_params_->group.num_tasks << " current task "
           << col_params_->instance.task_names[col_params_->default_rank]
           << " num local devices " << num_local_devices
-          << " num global devices " << num_global_devices;
+          << " num global devices " << num_global_devices << " device "
+          << col_ctx_->device_name << " instance "
+          << col_params_->instance.instance_key;
   NcclManager::instance()->AddToAllReduce(
       std::move(participant),
       {nccl_collective_key, num_local_devices, num_global_devices,
-       col_params_->instance.communicator_key},
+       col_params_->group.runtime_details.communicator_key},
       reduction_op);
 
   // NOTE(ayushd): We need to synchronize NCCL launches across nodes to prevent

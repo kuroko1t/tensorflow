@@ -20,9 +20,9 @@ from __future__ import print_function
 
 from absl.testing import parameterized
 import numpy as np
-
-from tensorflow.contrib.distribute.python import combinations
+from tensorflow.contrib.distribute.python import parameter_server_strategy
 from tensorflow.python import keras
+from tensorflow.python.distribute import combinations
 from tensorflow.python.distribute import distribution_strategy_context as ds_context
 from tensorflow.python.eager import context
 from tensorflow.python.framework import constant_op
@@ -34,6 +34,16 @@ from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.ops import variables
 from tensorflow.python.platform import test
+
+
+# TODO(rchao): Merge parameter_server_strategy_with_two_gpus into
+# third_party/tensorflow/python/distribute/strategy_combinations.py
+# pylint: disable=g-long-lambda
+parameter_server_strategy_with_two_gpus = combinations.NamedDistribution(
+    'ParameterServer2GPUs',
+    lambda: parameter_server_strategy.ParameterServerStrategy(
+        num_gpus_per_worker=2),
+    required_gpus=2)
 
 
 def get_model():
@@ -48,9 +58,7 @@ class MirroredStrategyOptimizerV2Test(test.TestCase, parameterized.TestCase):
   @combinations.generate(
       combinations.combine(
           distribution=[
-              combinations.core_mirrored_strategy_with_gpu_and_cpu,
-              combinations.core_mirrored_strategy_with_two_gpus,
-              combinations.parameter_server_strategy_with_two_gpus,
+              parameter_server_strategy_with_two_gpus,
           ],
           mode=['graph', 'eager']))
   def testKerasOptimizerWithUnequalInput(self, distribution):
@@ -64,7 +72,7 @@ class MirroredStrategyOptimizerV2Test(test.TestCase, parameterized.TestCase):
 
         def loss_fn():
           replica_id = _replica_id()
-          return math_ops.cast(replica_id + 1, dtype=dtypes.float32) * var
+          return math_ops.cast(replica_id + 1, dtype=dtypes.float32) * 0.5 * var
 
         train_op = optimizer.minimize(loss_fn, var_list=[var])
 
@@ -106,8 +114,7 @@ class MirroredStrategyOptimizerV2Test(test.TestCase, parameterized.TestCase):
   @combinations.generate(
       combinations.combine(
           distribution=[
-              combinations.core_mirrored_strategy_with_gpu_and_cpu,
-              combinations.parameter_server_strategy_with_two_gpus,
+              parameter_server_strategy_with_two_gpus,
           ],
           mode=['graph', 'eager']))
   def testOptimizerWithKerasModelAndNumpyArrays(self, distribution):

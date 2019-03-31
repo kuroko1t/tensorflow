@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "tensorflow/compiler/tf2xla/tf2xla_util.h"
 
+#include <functional>
 #include <queue>
 #include <random>
 #include <set>
@@ -113,7 +114,7 @@ Status ReplaceArgUsageWithConstNode(
   // Collect all _Arg nodes.
   std::unordered_map<int, Node*> arg_nodes;
   for (Node* n : g->op_nodes()) {
-    if (n->type_string() == FunctionLibraryDefinition::kArgOp) {
+    if (n->IsArg()) {
       int index;
       TF_RETURN_IF_ERROR(GetNodeAttr(n->attrs(), "index", &index));
       arg_nodes[index] = n;
@@ -122,7 +123,12 @@ Status ReplaceArgUsageWithConstNode(
 
   for (const auto& iter : const_input_index_to_node) {
     int arg_index = iter.first;
-    Node* const_node = g->CopyNode(iter.second);
+    NodeDef const_def = iter.second->def();
+    const_def.set_name(g->NewName(const_def.name()));
+    Status s;
+    Node* const_node = g->AddNode(const_def, &s);
+    TF_RETURN_IF_ERROR(s);
+
     Node* arg_node = arg_nodes[arg_index];
 
     // Collect all usages of the _Arg node.
@@ -178,14 +184,9 @@ Status PropagateConstIntoFuncAttr(
     return errors::Internal("Cannot find function ", func_attr.name(),
                             " for node ", n->name());
   }
-  FunctionBody* fbody;
+  std::unique_ptr<FunctionBody> fbody;
   TF_RETURN_IF_ERROR(FunctionDefToBodyHelper(
-      *fdef, AttrSlice(&func_attr.attr()), lookup_fld,
-      [lookup_fld](const string& op, const OpDef** sig) {
-        return lookup_fld->LookUpOpDef(op, sig);
-      },
-      &fbody));
-  std::unique_ptr<FunctionBody> fbody_deleter(fbody);
+      *fdef, AttrSlice(&func_attr.attr()), lookup_fld, &fbody));
 
   // Rewrite _Arg usages with Const node.
   Graph* func_graph = fbody->graph;
@@ -550,7 +551,9 @@ uint32 GetXLARandomSeed() {
   // after an overflow. When seeded with zero, some XLA backends
   // can return all zeros instead of random numbers.
   static std::atomic<uint32> counter(InitialRandomSeed());
-  return counter.fetch_add(2);
+  uint32 seed = counter.fetch_add(2);
+  std::srand(seed);
+  return std::rand() | 1;
 }
 
 // TODO(b/77601805): add tests for associated function related stuff.
