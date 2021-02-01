@@ -22,24 +22,21 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os
-
-
-_force_enable = False
+from tensorflow.python.platform import _pywrap_tf2
+from tensorflow.python.util.tf_export import tf_export
 
 
 def enable():
-  """Enables v2 behaviors."""
-  global _force_enable
-  _force_enable = True
+  # Enables v2 behaviors.
+  _pywrap_tf2.enable(True)
 
 
 def disable():
-  """Disables v2 behaviors (TF2_BEHAVIOR env variable is still respected)."""
-  global _force_enable
-  _force_enable = False
+  # Disables v2 behaviors.
+  _pywrap_tf2.enable(False)
 
 
+@tf_export("__internal__.tf2.enabled", v1=[])
 def enabled():
-  """Returns True iff TensorFlow 2.0 behavior should be enabled."""
-  return _force_enable or os.getenv("TF2_BEHAVIOR", "0") != "0"
+  # Returns True iff TensorFlow 2.0 behavior should be enabled.
+  return _pywrap_tf2.is_enabled()

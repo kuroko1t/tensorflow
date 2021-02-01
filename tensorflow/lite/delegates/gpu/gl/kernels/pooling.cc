@@ -24,25 +24,24 @@ limitations under the License.
 #include "absl/memory/memory.h"
 #include "tensorflow/lite/delegates/gpu/common/status.h"
 #include "tensorflow/lite/delegates/gpu/common/types.h"
+#include "tensorflow/lite/delegates/gpu/gl/variable.h"
 
 namespace tflite {
 namespace gpu {
 namespace gl {
 namespace {
 
-Status GenerateMaxPoolingCode(const Pooling2DAttributes& attr,
-                              const NodeShader::GenerationContext& ctx,
-                              GeneratedCode* generated_code) {
-  auto input = ctx.graph->FindInputs(ctx.node->id)[0];
-
+absl::Status GenerateMaxPoolingCode(const Pooling2DAttributes& attr,
+                                    const NodeShader::GenerationContext& ctx,
+                                    GeneratedCode* generated_code) {
   if (attr.padding.prepended.h > attr.kernel.h ||
       attr.padding.prepended.w > attr.kernel.w) {
-    return InvalidArgumentError("Padding is bigger than kernel.");
+    return absl::InvalidArgumentError("Padding is bigger than kernel.");
   }
 
-  std::vector<UniformParameter> parameters = {
-      {"input_data_0_h", input->tensor.shape.h},
-      {"input_data_0_w", input->tensor.shape.w},
+  std::vector<Variable> parameters = {
+      {"input_data_0_h", static_cast<int>(ctx.input_shapes[0][1])},
+      {"input_data_0_w", static_cast<int>(ctx.input_shapes[0][2])},
       {"stride", int2(attr.strides.w, attr.strides.h)},
       {"offset", int2(attr.padding.prepended.w, attr.padding.prepended.h)},
       {"window_h", attr.kernel.h},
@@ -86,66 +85,104 @@ Status GenerateMaxPoolingCode(const Pooling2DAttributes& attr,
   *generated_code = {
       /*parameters=*/std::move(parameters),
       /*objects=*/{},
+      /*shared_variables=*/{},
       /*workload=*/uint3(),
       /*workgroup=*/uint3(),
       /*source_code=*/std::move(source),
       /*input=*/IOStructure::ONLY_DEFINITIONS,
       /*output=*/IOStructure::AUTO,
   };
-  return OkStatus();
+  return absl::OkStatus();
 }
 
-Status GenerateAveragePoolingCode(const Pooling2DAttributes& attr,
-                                  const NodeShader::GenerationContext& ctx,
-                                  GeneratedCode* generated_code) {
-  auto input = ctx.graph->FindInputs(ctx.node->id)[0];
-
-  std::vector<UniformParameter> parameters = {
-      {"input_data_0_h", input->tensor.shape.h},
-      {"input_data_0_w", input->tensor.shape.w},
+absl::Status GenerateAveragePoolingCode(
+    const Pooling2DAttributes& attr, const NodeShader::GenerationContext& ctx,
+    GeneratedCode* generated_code) {
+  std::vector<Variable> parameters = {
+      {"input_data_0_h", static_cast<int>(ctx.input_shapes[0][1])},
+      {"input_data_0_w", static_cast<int>(ctx.input_shapes[0][2])},
       {"stride", int2(attr.strides.w, attr.strides.h)},
       {"offset", int2(attr.padding.prepended.w, attr.padding.prepended.h)},
       {"window_h", attr.kernel.h},
       {"window_w", attr.kernel.w},
-      {"multiplier", 1.0f / static_cast<float>(attr.kernel.h * attr.kernel.w)},
   };
 
-  std::string source = R"(
+  // Bounds checking helper functions.
+  auto x_in_bounds = [input_width = ctx.input_shapes[0][2],
+                      kernel_width = attr.kernel.w](int64_t x) -> bool {
+    return 0 <= x && x + kernel_width <= input_width;
+  };
+  auto y_in_bounds = [input_height = ctx.input_shapes[0][1],
+                      kernel_height = attr.kernel.h](int64_t y) -> bool {
+    return 0 <= y && y + kernel_height <= input_height;
+  };
+
+  // Only include a bounds check in the shader if it will actually be necessary
+  // at run time.
+  const int64_t output_shape_max_y = ctx.output_shapes[0][1] - 1;
+  const int64_t output_shape_max_x = ctx.output_shapes[0][2] - 1;
+  const int64_t base_x = -attr.padding.prepended.w;
+  const int64_t base_y = -attr.padding.prepended.h;
+  const bool bounds_check_necessary =
+      !(x_in_bounds(base_x) &&
+        x_in_bounds(base_x + output_shape_max_x * attr.strides.w) &&
+        y_in_bounds(base_y) &&
+        y_in_bounds(base_y + output_shape_max_y * attr.strides.h));
+
+  std::string source = bounds_check_necessary ?
+                                              R"(
+  int window_size = 0;
   for (int a = 0; a < $window_h$; ++a) {
     for (int b = 0; b < $window_w$; ++b) {
       ivec2 coord = gid.xy * $stride$ - $offset$ + ivec2(b, a);
       if (coord.x >= 0 && coord.y >= 0 && coord.x < $input_data_0_w$ && coord.y < $input_data_0_h$) {
         value_0 += $input_data_0[coord.x, coord.y, gid.z]$;
+        window_size++;
       }
     }
   }
-  value_0 *= $multiplier$;
+  // If window_size==0, window covered nothing. This situation is a sign of
+  // incorrectly constructed operation. NaNs are expected as output.
+  value_0 /= float(window_size);
+)"
+                                              :
+                                              R"(
+  for (int a = 0; a < $window_h$; ++a) {
+    for (int b = 0; b < $window_w$; ++b) {
+      ivec2 coord = gid.xy * $stride$ - $offset$ + ivec2(b, a);
+      value_0 += $input_data_0[coord.x, coord.y, gid.z]$;
+    }
+  }
+  // If the denominator is 0, that is a sign of an incorrectly constructed
+  // operation. NaNs are expected as output.
+  value_0 /= float($window_h$ * $window_w$);
 )";
+
   *generated_code = {
       /*parameters=*/std::move(parameters),
       /*objects=*/{},
+      /*shared_variables=*/{},
       /*workload=*/uint3(),
       /*workgroup=*/uint3(),
       /*source_code=*/std::move(source),
       /*input=*/IOStructure::ONLY_DEFINITIONS,
       /*output=*/IOStructure::AUTO,
   };
-  return OkStatus();
+  return absl::OkStatus();
 }
 
 class Pooling : public NodeShader {
  public:
-  Status GenerateCode(const GenerationContext& ctx,
-                      GeneratedCode* generated_code) const final {
-    const auto& attr =
-        absl::any_cast<Pooling2DAttributes>(ctx.node->operation.attributes);
+  absl::Status GenerateCode(const GenerationContext& ctx,
+                            GeneratedCode* generated_code) const final {
+    const auto& attr = absl::any_cast<const Pooling2DAttributes&>(ctx.op_attr);
     switch (attr.type) {
       case PoolingType::AVERAGE:
         return GenerateAveragePoolingCode(attr, ctx, generated_code);
       case PoolingType::MAX:
         return GenerateMaxPoolingCode(attr, ctx, generated_code);
       default:
-        return InvalidArgumentError("Incorrect attributes' type.");
+        return absl::InvalidArgumentError("Incorrect attributes' type.");
     }
   }
 };

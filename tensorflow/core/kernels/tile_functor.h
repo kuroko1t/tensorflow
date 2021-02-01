@@ -32,15 +32,11 @@ template <typename T>
 void TileSimple(const Eigen::ThreadPoolDevice& d, Tensor* out,
                 const Tensor& in);
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 template <typename T>
 void TileSimple(const Eigen::GpuDevice& d, Tensor* out, const Tensor& in);
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
-#ifdef TENSORFLOW_USE_SYCL
-template <typename T>
-void TileSimple(const Eigen::SyclDevice& d, Tensor* out, const Tensor& in);
-#endif
 
 template <typename Device, typename T, typename Tmultiples, int NDIM>
 void TileUsingEigen(const Device& d, Tensor* out, const Tensor& in,

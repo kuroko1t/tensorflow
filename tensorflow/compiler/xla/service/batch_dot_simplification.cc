@@ -23,6 +23,24 @@ namespace xla {
 StatusOr<bool>
 BatchDotSimplification::ElideDegenerateBatchDimensionFromBatchDot(
     HloInstruction* batch_dot) {
+  // This pass assumes the lhs and rhs batch dimensions are equal and strictly
+  // ascending.
+  const auto& is_iota = [](absl::Span<const int64> dims) {
+    for (int64 i = 0; i < dims.size(); ++i) {
+      if (dims[i] != i) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!absl::c_equal(
+          batch_dot->dot_dimension_numbers().lhs_batch_dimensions(),
+          batch_dot->dot_dimension_numbers().rhs_batch_dimensions()) ||
+      !is_iota(AsInt64Slice(
+          batch_dot->dot_dimension_numbers().lhs_batch_dimensions()))) {
+    return false;
+  }
+
   const DotDimensionNumbers& dim_numbers = batch_dot->dot_dimension_numbers();
   HloInstruction *lhs = batch_dot->mutable_operand(0),
                  *rhs = batch_dot->mutable_operand(1);
@@ -69,9 +87,11 @@ BatchDotSimplification::ElideDegenerateBatchDimensionFromBatchDot(
       0,
       new_dim_numbers.rhs_contracting_dimensions(0) - degenerate_dims.size());
 
-  TF_ASSIGN_OR_RETURN(HloInstruction * new_dot,
-                      MakeDotHlo(new_lhs, new_rhs, new_dim_numbers,
-                                 batch_dot->precision_config()));
+  TF_ASSIGN_OR_RETURN(
+      HloInstruction * new_dot,
+      MakeDotHlo(new_lhs, new_rhs, new_dim_numbers,
+                 batch_dot->precision_config(),
+                 /*preferred_element_type=*/batch_dot->shape().element_type()));
 
   TF_ASSIGN_OR_RETURN(HloInstruction * new_dot_reshaped,
                       MakeReshapeHlo(batch_dot->shape(), new_dot));

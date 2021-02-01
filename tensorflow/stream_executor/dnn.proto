@@ -3,6 +3,8 @@ syntax = "proto3";
 
 package stream_executor.dnn;
 
+option go_package = "github.com/tensorflow/tensorflow/tensorflow/go/stream_executor";
+
 // Specifies the data type used by an operation.
 enum DataType {
   kFloat = 0;
@@ -10,6 +12,8 @@ enum DataType {
   kHalf = 2;
   kInt8 = 3;
   kInt32 = 4;
+  kComplexFloat = 5;
+  kComplexDouble = 6;
 }
 
 // Describes how a convolution input or output layer's data is formatted.
@@ -71,6 +75,7 @@ enum ConvolutionKind {
   FORWARD = 1;
   BACKWARD_FILTER = 2;
   BACKWARD_DATA = 3;
+  FORWARD_BIAS_ACTIVATION = 4;
 }
 
 // Generic tensor representation.
@@ -107,4 +112,6 @@ message ConvolutionDescriptorProto {
   // See cuDNN's group count.
   int32 group_count = 5;
   ConvolutionMode convolution_mode = 6;
+  // Tensorflow node name, same as in NodeDef, for debugging purposes.
+  string name = 7;
 }

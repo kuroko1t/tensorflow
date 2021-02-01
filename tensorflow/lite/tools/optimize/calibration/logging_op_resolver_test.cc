@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 #include "tensorflow/lite/tools/optimize/calibration/logging_op_resolver.h"
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "tensorflow/lite/mutable_op_resolver.h"
@@ -38,6 +39,14 @@ TfLiteStatus AddEval(TfLiteContext* context, TfLiteNode* node) {
   return kTfLiteOk;
 }
 
+TfLiteStatus CustomPrepare(TfLiteContext* context, TfLiteNode* node) {
+  return kTfLiteOk;
+}
+
+TfLiteStatus CustomEval(TfLiteContext* context, TfLiteNode* node) {
+  return kTfLiteOk;
+}
+
 TfLiteStatus WrappingInvoke(TfLiteContext* context, TfLiteNode* node) {
   return kTfLiteOk;
 }
@@ -60,7 +69,8 @@ TEST(LoggingOpResolverTest, KernelInvokesAreReplaced) {
       {BuiltinOperator_ADD, /*version*/ 1},
   };
 
-  LoggingOpResolver resolver(ops_to_replace, base_resolver, WrappingInvoke);
+  LoggingOpResolver resolver(ops_to_replace, CustomOpsSet(), base_resolver,
+                             WrappingInvoke, /*error_reporter=*/nullptr);
 
   auto reg = resolver.FindOp(BuiltinOperator_CONV_2D, 1);
 
@@ -93,7 +103,8 @@ TEST(LoggingOpResolverTest, OriginalKernelInvokesAreRetained) {
       {BuiltinOperator_ADD, /*version*/ 1},
   };
 
-  LoggingOpResolver resolver(ops_to_replace, base_resolver, WrappingInvoke);
+  LoggingOpResolver resolver(ops_to_replace, CustomOpsSet(), base_resolver,
+                             WrappingInvoke, /*error_reporter=*/nullptr);
   auto kernel_invoke =
       resolver.GetWrappedKernelInvoke(BuiltinOperator_CONV_2D, 1);
   EXPECT_TRUE(kernel_invoke == ConvEval);
@@ -119,7 +130,8 @@ TEST(LoggingOpResolverTest, OnlyOpsInReplacementSetAreReplaces) {
       {BuiltinOperator_CONV_2D, /*version*/ 1},
   };
 
-  LoggingOpResolver resolver(ops_to_replace, base_resolver, WrappingInvoke);
+  LoggingOpResolver resolver(ops_to_replace, CustomOpsSet(), base_resolver,
+                             WrappingInvoke, /*error_reporter=*/nullptr);
   auto reg = resolver.FindOp(BuiltinOperator_CONV_2D, 1);
   EXPECT_EQ(reg->builtin_code, BuiltinOperator_CONV_2D);
   EXPECT_TRUE(reg->prepare == ConvPrepare);
@@ -129,13 +141,84 @@ TEST(LoggingOpResolverTest, OnlyOpsInReplacementSetAreReplaces) {
   EXPECT_EQ(nullptr, reg);
 }
 
+TEST(LoggingOpResolverTest, CustomOps) {
+  MutableOpResolver base_resolver;
+  TfLiteRegistration custom_registration = {};
+  custom_registration.prepare = CustomPrepare;
+  custom_registration.invoke = CustomEval;
+
+  std::string custom_op_name = "custom";
+  base_resolver.AddCustom(custom_op_name.c_str(), &custom_registration);
+
+  CustomOpsSet ops_to_replace = {
+      {custom_op_name, /*version*/ 1},
+  };
+
+  LoggingOpResolver resolver(BuiltinOpsSet(), ops_to_replace, base_resolver,
+                             WrappingInvoke, /*error_reporter=*/nullptr);
+
+  auto reg = resolver.FindOp(custom_op_name.c_str(), 1);
+
+  EXPECT_EQ(reg->builtin_code, BuiltinOperator_CUSTOM);
+  EXPECT_EQ(reg->custom_name, custom_op_name.c_str());
+  EXPECT_TRUE(reg->prepare == CustomPrepare);
+  EXPECT_TRUE(reg->invoke == WrappingInvoke);
+}
+
+TEST(LoggingOpResolverTest, UnresolvedCustomOps) {
+  // No custom op registration.
+  MutableOpResolver base_resolver;
+
+  std::string custom_op_name = "unresolved_custom_op";
+
+  CustomOpsSet ops_to_replace = {
+      {custom_op_name, /*version*/ 1},
+  };
+
+  // Expect no death.
+  LoggingOpResolver(BuiltinOpsSet(), ops_to_replace, base_resolver,
+                    WrappingInvoke, /*error_reporter=*/nullptr);
+}
+
+TEST(LoggingOpResolverTest, UnresolvedBuiltinOps) {
+  // No builtin op registration.
+  MutableOpResolver base_resolver;
+
+  BuiltinOpsSet ops_to_replace = {
+      {BuiltinOperator_CONV_2D, /*version*/ 1},
+      {BuiltinOperator_ADD, /*version*/ 1},
+  };
+
+  // Expect no death.
+  LoggingOpResolver resolver(ops_to_replace, CustomOpsSet(), base_resolver,
+                             WrappingInvoke, /*error_reporter=*/nullptr);
+}
+
+TEST(LoggingOpResolverTest, FlexOps) {
+  // No flex op registration.
+  MutableOpResolver base_resolver;
+
+  std::string custom_op_name = "FlexAdd";
+
+  CustomOpsSet ops_to_replace = {
+      {custom_op_name, /*version*/ 1},
+  };
+
+  LoggingOpResolver resolver(BuiltinOpsSet(), ops_to_replace, base_resolver,
+                             WrappingInvoke, /*error_reporter=*/nullptr);
+
+  auto reg = resolver.FindOp(custom_op_name.c_str(), 1);
+
+  EXPECT_TRUE(!reg);
+}
+
 }  // namespace
 }  // namespace calibration
 }  // namespace optimize
 }  // namespace tflite
 
 int main(int argc, char** argv) {
-  // On Linux, add: FLAGS_logtostderr = true;
+  // On Linux, add: absl::SetFlag(&FLAGS_logtostderr, true);
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

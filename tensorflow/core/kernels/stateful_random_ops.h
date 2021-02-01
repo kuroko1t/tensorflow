@@ -16,21 +16,18 @@ limitations under the License.
 #ifndef TENSORFLOW_CORE_KERNELS_STATEFUL_RANDOM_OPS_H_
 #define TENSORFLOW_CORE_KERNELS_STATEFUL_RANDOM_OPS_H_
 
-// #include "tensorflow/core/framework/resource_var.h"
+#include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/random/philox_random.h"
 
 namespace tensorflow {
 
 // 'Variable' doesn't support uint32 or uint64 yet (due to reasons explained
-// in b/111604096 and cl/171681867), so I use signed int here. I choose int64
-// instead of int32 because `VarHandleOp` doesn't support int32 on GPU.
+// in b/111604096 and cl/171681867), so we use signed int here. We choose int64
+// instead of int32 because `VarHandleOp` doesn't support int32 on GPU, and
+// because of the "int32 problem".
 using StateElementType = int64;
 static constexpr DataType STATE_ELEMENT_DTYPE = DT_INT64;
-
-using Algorithm = StateElementType;
 static constexpr DataType ALGORITHM_DTYPE = STATE_ELEMENT_DTYPE;
-static constexpr Algorithm RNG_ALG_PHILOX = 1;
-static constexpr Algorithm RNG_ALG_THREEFRY = 2;
 
 using random::PhiloxRandom;
 

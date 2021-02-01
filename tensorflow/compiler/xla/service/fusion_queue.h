@@ -15,8 +15,10 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_XLA_SERVICE_FUSION_QUEUE_H_
 #define TENSORFLOW_COMPILER_XLA_SERVICE_FUSION_QUEUE_H_
 
-#include <utility>
+#include <string>
+#include <vector>
 
+#include "absl/strings/str_cat.h"
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
 
 namespace xla {
@@ -46,6 +48,9 @@ class FusionQueue {
   // A callback passed to the queue implementation to notify the removal of an
   // instruction.
   virtual void RemoveInstruction(HloInstruction* instruction) = 0;
+
+  // Returns the fusion configuration.
+  virtual const std::vector<bool>* FusionConfiguration() = 0;
 };
 
 }  // namespace xla

@@ -20,11 +20,9 @@ limitations under the License.
 
 #include "tensorflow/core/framework/allocator.h"
 
-#if GOOGLE_CUDA
-#if GOOGLE_TENSORRT
-#include "tensorrt/include/NvInfer.h"
-#endif  // GOOGLE_TENSORRT
-#endif  // GOOGLE_CUDA
+#if GOOGLE_CUDA && GOOGLE_TENSORRT
+#include "third_party/tensorrt/NvInfer.h"
+#endif  // GOOGLE_CUDA && GOOGLE_TENSORRT
 
 namespace tensorflow {
 namespace tensorrt {
@@ -33,8 +31,7 @@ void* Align(uint64_t alignment, uint64_t size, void*& ptr, uint64_t& space);
 }  // namespace tensorrt
 }  // namespace tensorflow
 
-#if GOOGLE_CUDA
-#if GOOGLE_TENSORRT
+#if GOOGLE_CUDA && GOOGLE_TENSORRT
 
 namespace tensorflow {
 namespace tensorrt {
@@ -44,16 +41,6 @@ class TRTBaseAllocator : public nvinfer1::IGpuAllocator {
  public:
   // python wrapper seems to be not happy with an pure virtual destructor;
   virtual ~TRTBaseAllocator() = default;
-};
-
-class TRTCudaAllocator : public TRTBaseAllocator {
-  // Allocator implementation that is using cuda allocator instead of device
-  // allocator in case we can't get device allocator from TF.
- public:
-  TRTCudaAllocator() {}
-  virtual ~TRTCudaAllocator() {}
-  void* allocate(uint64_t size, uint64_t alignment, uint32_t flags) override;
-  void free(void* memory) override;
 };
 
 class TRTDeviceAllocator : public TRTBaseAllocator {
@@ -79,6 +66,5 @@ class TRTDeviceAllocator : public TRTBaseAllocator {
 }  // namespace tensorrt
 }  // namespace tensorflow
 
-#endif  // GOOGLE_TENSORRT
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA && GOOGLE_TENSORRT
 #endif  // TENSORFLOW_COMPILER_TF2TENSORRT_UTILS_TRT_ALLOCATOR_H_

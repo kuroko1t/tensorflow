@@ -14,182 +14,156 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/profiler/lib/profiler_session.h"
-#include <cstddef>
-#include <string>
-#include "tensorflow/core/common_runtime/eager/context.h"
-#include "tensorflow/core/lib/core/error_codes.pb.h"
-#include "tensorflow/core/platform/env.h"
+
+#include <memory>
+
+#include "absl/memory/memory.h"
+#include "tensorflow/core/platform/errors.h"
+#include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/mutex.h"
+#include "tensorflow/core/platform/platform.h"
+#include "tensorflow/core/platform/status.h"
 #include "tensorflow/core/platform/types.h"
-#include "tensorflow/core/profiler/internal/gpu/tracer.h"
-#include "tensorflow/core/profiler/internal/runtime/eager_profiler.h"
-#include "tensorflow/core/profiler/trace_events.pb.h"
+#include "tensorflow/core/profiler/lib/profiler_interface.h"
+#include "tensorflow/core/profiler/profiler_options.pb.h"
+#include "tensorflow/core/profiler/protobuf/xplane.pb.h"
 #include "tensorflow/core/protobuf/config.pb.h"
+#include "tensorflow/core/protobuf/error_codes.pb.h"
+
+#if !defined(IS_MOBILE_PLATFORM)
+#include "tensorflow/core/profiler/convert/post_process_single_host_xplane.h"
+#include "tensorflow/core/profiler/lib/profiler_factory.h"
+#include "tensorflow/core/profiler/lib/profiler_lock.h"
+#include "tensorflow/core/profiler/utils/time_utils.h"
+#endif
 
 namespace tensorflow {
-
 namespace {
 
-// Track whether there's an active ProfilerSession.
-// Prevents another ProfilerSession from creating ProfilerInterface(s), as they
-// use singletons that do not allow concurrent profiling request (e.g.,
-// DeviceTracer).
-std::atomic<bool> session_active = ATOMIC_VAR_INIT(false);
-
-void AssignLanes(RunMetadata* run_metadata) {
-  for (size_t device_id = 0;
-       device_id < run_metadata->step_stats().dev_stats_size(); ++device_id) {
-    auto* device_stats =
-        run_metadata->mutable_step_stats()->mutable_dev_stats(device_id);
-    if (device_stats->thread_names_size() > 0 ||
-        device_stats->node_stats_size() == 0) {
-      continue;
-    }
-    std::vector<uint64> lanes;
-    for (auto ns = device_stats->mutable_node_stats()->rbegin();
-         ns != device_stats->mutable_node_stats()->rend(); ns++) {
-      uint64 end_micros = ns->all_start_micros() + ns->all_end_rel_micros();
-      bool found_lane = false;
-      for (size_t l = 0; l < lanes.size(); l++) {
-        if (end_micros <= lanes[l]) {
-          ns->set_thread_id(l);
-          found_lane = true;
-          lanes[l] = ns->all_start_micros();
-          break;
-        }
-      }
-      if (!found_lane) {
-        ns->set_thread_id(lanes.size());
-        lanes.push_back(ns->all_start_micros());
-      }
-    }
-  }
+ProfileOptions GetOptions(const ProfileOptions& opts) {
+  if (opts.version()) return opts;
+  ProfileOptions options = ProfilerSession::DefaultOptions();
+  options.set_include_dataset_ops(opts.include_dataset_ops());
+  return options;
 }
 
-void ConvertRunMetadataToTraceEvent(RunMetadata* run_metadata,
-                                    profiler::Trace* trace,
-                                    const uint64 profile_start_time_micros,
-                                    const uint64 profile_end_time_micros) {
-  AssignLanes(run_metadata);
-  auto trace_devices = trace->mutable_devices();
-
-  for (size_t device_id = 0;
-       device_id < run_metadata->step_stats().dev_stats_size(); ++device_id) {
-    // Create device
-    auto* device_stats =
-        run_metadata->mutable_step_stats()->mutable_dev_stats(device_id);
-    profiler::Device device;
-    device.set_name(device_stats->device());
-    device.set_device_id(device_id);
-    profiler::Resource resource;
-    resource.set_name("0");
-    resource.set_resource_id(0);
-    (*device.mutable_resources())[0] = resource;
-    for (const auto& thread_name : device_stats->thread_names()) {
-      profiler::Resource resource;
-      resource.set_resource_id(thread_name.first);
-      resource.set_name(thread_name.second);
-      (*device.mutable_resources())[thread_name.first] = resource;
-    }
-    (*trace_devices)[device_id] = device;
-
-    // Emit events.
-    for (auto node :
-         run_metadata->step_stats().dev_stats(device_id).node_stats()) {
-      if (node.all_start_micros() < profile_start_time_micros ||
-          node.all_start_micros() + node.all_end_rel_micros() >
-              profile_end_time_micros) {
-        continue;
-      }
-      auto* event = trace->add_trace_events();
-      auto* args = event->mutable_args();
-      event->set_device_id(device_id);
-      event->set_resource_id(node.thread_id());
-      event->set_name(node.node_name());
-      event->set_timestamp_ps(
-          (node.all_start_micros() - profile_start_time_micros) *
-          EnvTime::kMicrosToPicos);
-      event->set_duration_ps(node.all_end_rel_micros() *
-                             EnvTime::kMicrosToPicos);
-      (*args)["label"] = node.timeline_label();
-    }
-  }
-
-  // TODO(fishx): Convert allocation data as well.
-}
-
-}  // namespace
+};  // namespace
 
 /*static*/ std::unique_ptr<ProfilerSession> ProfilerSession::Create(
-    ProfilerContext* const context) {
-  return absl::WrapUnique(new ProfilerSession(context));
+    const ProfileOptions& options) {
+  return absl::WrapUnique(new ProfilerSession(GetOptions(options)));
 }
 
-Status ProfilerSession::Status() {
+tensorflow::Status ProfilerSession::Status() {
   mutex_lock l(mutex_);
   return status_;
 }
 
-Status ProfilerSession::SerializeToString(string* content) {
+Status ProfilerSession::CollectData(profiler::XSpace* space) {
   mutex_lock l(mutex_);
-  if (!status_.ok()) return status_;
+  TF_RETURN_IF_ERROR(status_);
+#if !defined(IS_MOBILE_PLATFORM)
+  LOG(INFO) << "Profiler session collecting data.";
   for (auto& profiler : profilers_) {
     profiler->Stop().IgnoreError();
   }
-  RunMetadata run_metadata;
+
   for (auto& profiler : profilers_) {
-    profiler->CollectData(&run_metadata).IgnoreError();
+    profiler->CollectData(space).IgnoreError();
   }
 
   if (active_) {
     // Allow another session to start.
-    session_active.store(false);
+    profiler::ReleaseProfilerLock();
     active_ = false;
   }
 
-  profiler::Trace trace;
+  PostProcessSingleHostXSpace(space, start_time_ns_);
+#endif
 
-  ConvertRunMetadataToTraceEvent(
-      &run_metadata, &trace, start_time_micros_,
-      Env::Default()->NowNanos() / EnvTime::kMicrosToNanos);
-
-  trace.SerializeToString(content);
   return Status::OK();
 }
 
-ProfilerSession::ProfilerSession(ProfilerContext* const context)
-    : active_(!session_active.exchange(true)),
-      start_time_micros_(Env::Default()->NowNanos() / EnvTime::kMicrosToNanos) {
+Status ProfilerSession::CollectData(RunMetadata* run_metadata) {
+  mutex_lock l(mutex_);
+  TF_RETURN_IF_ERROR(status_);
+#if !defined(IS_MOBILE_PLATFORM)
+  for (auto& profiler : profilers_) {
+    profiler->Stop().IgnoreError();
+  }
+
+  for (auto& profiler : profilers_) {
+    profiler->CollectData(run_metadata).IgnoreError();
+  }
+
+  if (active_) {
+    // Allow another session to start.
+    profiler::ReleaseProfilerLock();
+    active_ = false;
+  }
+#endif
+
+  return Status::OK();
+}
+
+ProfilerSession::ProfilerSession(ProfileOptions options)
+#if defined(IS_MOBILE_PLATFORM)
+    : active_(false),
+      status_(tensorflow::Status(
+          error::UNIMPLEMENTED,
+          "Profiler is unimplemented for mobile platforms.")),
+#else
+    : active_(profiler::AcquireProfilerLock()),
+#endif
+      options_(std::move(options)) {
+#if !defined(IS_MOBILE_PLATFORM)
   if (!active_) {
-    status_ = tensorflow::Status(tensorflow::error::Code::UNAVAILABLE,
-                                 "Another profiling session is active.");
+    status_ = tensorflow::Status(error::UNAVAILABLE,
+                                 "Another profiler session is active.");
     return;
   }
 
-  LOG(INFO) << "Profile Session started.";
-
-  if (context->eager_context != nullptr) {
-    profilers_.push_back(tensorflow::profiler::runtime::EagerProfiler::Create(
-        context->eager_context));
+  LOG(INFO) << "Profiler session initializing.";
+  // Sleep until it is time to start profiling.
+  if (options_.start_timestamp_ns() > 0) {
+    int64 sleep_duration_ns =
+        options_.start_timestamp_ns() - profiler::GetCurrentTimeNanos();
+    if (sleep_duration_ns < 0) {
+      LOG(WARNING) << "Profiling is late by " << -sleep_duration_ns
+                   << " nanoseconds and will start immediately.";
+    } else {
+      LOG(INFO) << "Delaying start of profiler session by "
+                << sleep_duration_ns;
+      profiler::SleepForNanos(sleep_duration_ns);
+    }
   }
-  profilers_.push_back(tensorflow::profiler::gpu::Tracer::Create());
 
+  LOG(INFO) << "Profiler session started.";
+  start_time_ns_ = profiler::GetCurrentTimeNanos();
+  CreateProfilers(options_, &profilers_);
   status_ = Status::OK();
 
   for (auto& profiler : profilers_) {
-    profiler->Start().IgnoreError();
+    auto start_status = profiler->Start();
+    if (!start_status.ok()) {
+      LOG(WARNING) << "Encountered error while starting profiler: "
+                   << start_status.ToString();
+    }
   }
+#endif
 }
 
 ProfilerSession::~ProfilerSession() {
+#if !defined(IS_MOBILE_PLATFORM)
+  LOG(INFO) << "Profiler session tear down.";
   for (auto& profiler : profilers_) {
     profiler->Stop().IgnoreError();
   }
 
   if (active_) {
     // Allow another session to start.
-    session_active.store(false);
+    profiler::ReleaseProfilerLock();
   }
+#endif
 }
-
 }  // namespace tensorflow

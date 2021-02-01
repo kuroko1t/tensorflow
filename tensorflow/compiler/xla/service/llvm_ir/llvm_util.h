@@ -87,7 +87,7 @@ string DumpModuleToString(const llvm::Module& module);
 //   - joining all of the nonempty inputs by '.', and then
 //   - removing all '%'s.
 //
-string IrName(string a);
+string IrName(absl::string_view a);
 string IrName(absl::string_view a, absl::string_view b);
 string IrName(const HloInstruction* a, absl::string_view b = "");
 
@@ -108,12 +108,12 @@ llvm::CallInst* EmitCallToIntrinsic(
 // Emit float max. Emit maxnum intrinsic is fast math is disabled, or
 // fcmp+select otherwise
 llvm::Value* EmitFloatMax(llvm::Value* lhs_value, llvm::Value* rhs_value,
-                          llvm::IRBuilder<>* b);
+                          llvm::IRBuilder<>* b, bool enable_fast_min_max);
 
 // Emit float min. Emit minnum intrinsic is fast math is disabled, or
 // fcmp+select otherwise
 llvm::Value* EmitFloatMin(llvm::Value* lhs_value, llvm::Value* rhs_value,
-                          llvm::IRBuilder<>* b);
+                          llvm::IRBuilder<>* b, bool enable_fast_min_max);
 
 // Convenience methods for emitting a GEP instruction that indexes into a buffer
 // (1-dimensional array), equivalent to array[index]. The type is automatically
@@ -140,14 +140,6 @@ llvm::Type* ShapeToIrType(const Shape& shape, llvm::Module* module);
 StatusOr<llvm::Value*> EncodeSelfDescribingShapeConstant(const Shape& shape,
                                                          int32* shape_size,
                                                          llvm::IRBuilder<>* b);
-
-// Inverses the encoding of a Shape protobuf into an LLVM global variable.
-//
-// This is intended to be called from the runtime to decode the llvm::Constants
-// that are created via ConvertShapeToSelfDescribingConstant and subsequently
-// embedded into the program.
-StatusOr<Shape> DecodeSelfDescribingShapeConstant(const void* shape_ptr,
-                                                  int32 size_bytes);
 
 // Converts a given literal to an IR Constant. Literals have known constant
 // values at IR emission time.
@@ -280,7 +272,8 @@ std::map<int, llvm::MDNode*> MergeMetadata(
 // If `optimized` is true then a suffix of "-with-opt.ll" is used, else a suffix
 // of "-no-opt.ll" is used.
 void DumpIrIfEnabled(const HloModule& hlo_module,
-                     const llvm::Module& llvm_module, bool optimized);
+                     const llvm::Module& llvm_module, bool optimized,
+                     absl::string_view filename_suffix = "");
 
 llvm::Function* CreateCpuFunction(llvm::FunctionType* function_type,
                                   llvm::GlobalValue::LinkageTypes linkage,
@@ -300,18 +293,20 @@ std::pair<llvm::Value*, llvm::Value*> UMulLowHigh32(llvm::IRBuilder<>* b,
 std::pair<llvm::Value*, llvm::Value*> SplitInt64ToInt32s(
     llvm::IRBuilder<>* b, llvm::Value* value_64bits);
 
-// Checks whether a global variable is already created to represent a
-// state passed between RNG calls implemented with Philox algorithm. If not,
-// creates such a variable. Returns the global variable.
-llvm::GlobalVariable* GetOrCreateVariableForPhiloxRngState(
-    llvm::Module* module, llvm::IRBuilder<>* b);
+// Checks whether a global variable is already created to represent the state
+// of a random number generator. If not, creates such a variable. Returns the
+// global variable.
+llvm::GlobalVariable* GetOrCreateVariableRngState(llvm::Module* module,
+                                                  llvm::IRBuilder<>* b);
 
-// Adds a value to the global state variable each time when a RNG hlo is
-// executed. The value of this global state variable is added to the seed
-// of the Philox RNG algorithm so that calling the same RNG Hlo multiple times
-// should rarely produce the same result.
-void IncrementVariableForPhiloxRngState(int64 value, llvm::Module* module,
-                                        llvm::IRBuilder<>* b);
+// Adds a delta value to the global state variable and return the old value of
+// the variable.
+llvm::Value* RngGetAndUpdateState(uint64 delta, llvm::Module* module,
+                                  llvm::IRBuilder<>* b);
+
+// Gets the LLVM address space that should be used for global variables (e.g.
+// XLA's rng state).
+unsigned GetGlobalMemoryAddressSpace(const llvm::Module& module);
 }  // namespace llvm_ir
 }  // namespace xla
 

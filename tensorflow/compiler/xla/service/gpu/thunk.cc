@@ -18,10 +18,24 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
+StatusOr<GlobalDeviceId> Thunk::ExecuteParams::GetGlobalDeviceId() const {
+  int64 local_device_ordinal = stream->parent()->device_ordinal();
+  if (gpu_global_device_ids) {
+    TF_RET_CHECK(0 <= local_device_ordinal &&
+                 local_device_ordinal < gpu_global_device_ids->size());
+    return (*gpu_global_device_ids)[local_device_ordinal];
+  } else {
+    // No local -> global mapping was provided; assume the identity mapping.
+    return GlobalDeviceId(local_device_ordinal);
+  }
+}
+
 absl::string_view ThunkKindToString(Thunk::Kind kind) {
   switch (kind) {
     case Thunk::kCholesky:
       return "kCholesky";
+    case Thunk::kCollectivePermute:
+      return "kCollectivePermute";
     case Thunk::kConditional:
       return "kConditional";
     case Thunk::kConvolution:
@@ -34,8 +48,14 @@ absl::string_view ThunkKindToString(Thunk::Kind kind) {
       return "kCudnnBatchNormForwardInference";
     case Thunk::kCudnnBatchNormForwardTraining:
       return "kCudnnBatchNormForwardTraining";
+    case Thunk::kCustomCall:
+      return "kCustomCall";
+    case Thunk::kNcclAllGather:
+      return "kNcclAllGather";
     case Thunk::kNcclAllReduce:
       return "kNcclAllReduce";
+    case Thunk::kNcclAllToAll:
+      return "kNcclAllToAll";
     case Thunk::kFft:
       return "kFft";
     case Thunk::kGemm:
@@ -50,6 +70,10 @@ absl::string_view ThunkKindToString(Thunk::Kind kind) {
       return "kMemzero";
     case Thunk::kOutfeed:
       return "kOutfeed";
+    case Thunk::kReplicaId:
+      return "kReplicaId";
+    case Thunk::kPartitionId:
+      return "kPartitionId";
     case Thunk::kSequential:
       return "kSequential";
     case Thunk::kTriangularSolve:

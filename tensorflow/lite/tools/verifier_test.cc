@@ -12,6 +12,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include "tensorflow/lite/tools/verifier.h"
+
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -21,17 +24,23 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "tensorflow/core/framework/numeric_types.h"
 #include "tensorflow/lite/allocation.h"
+#include "tensorflow/lite/core/api/flatbuffer_conversions.h"
 #include "tensorflow/lite/error_reporter.h"
+#include "tensorflow/lite/model.h"
+#include "tensorflow/lite/mutable_op_resolver.h"
 #include "tensorflow/lite/op_resolver.h"
+#include "tensorflow/lite/schema/schema_conversion_utils.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/testing/util.h"
-#include "tensorflow/lite/tools/verifier.h"
+#include "tensorflow/lite/util.h"
 #include "tensorflow/lite/version.h"
 
 namespace tflite {
 
-using flatbuffers::FlatBufferBuilder;
-using flatbuffers::Offset;
+namespace {
+static const char* kSparseTensorTestModel =
+    "tensorflow/lite/testdata/sparse_tensor.bin";
+}  // namespace
 
 class MockErrorReporter : public ErrorReporter {
  public:
@@ -110,7 +119,7 @@ class TfLiteFlatbufferModelBuilder {
   void FinishModel(const std::vector<int32_t>& inputs,
                    const std::vector<int32_t>& outputs,
                    BuilderMode mode = kBuilderModeDefault) {
-    auto subgraph = std::vector<Offset<SubGraph>>({CreateSubGraph(
+    auto subgraph = std::vector<flatbuffers::Offset<SubGraph>>({CreateSubGraph(
         builder_, CreateVector(tensors_, mode), CreateVector(inputs, mode),
         CreateVector(outputs, mode), CreateVector(operators_, mode),
         builder_.CreateString("test_subgraph"))});
@@ -138,18 +147,18 @@ class TfLiteFlatbufferModelBuilder {
     return builder_.CreateVector(v);
   }
 
-  FlatBufferBuilder builder_;
+  flatbuffers::FlatBufferBuilder builder_;
   MutableOpResolver resolver_;
   TfLiteRegistration fake_op_;
   MockErrorReporter mock_reporter_;
-  std::vector<Offset<Operator>> operators_;
-  std::vector<Offset<OperatorCode>> operator_codes_;
-  std::vector<Offset<Tensor>> tensors_;
-  std::vector<Offset<Buffer>> buffers_;
+  std::vector<flatbuffers::Offset<Operator>> operators_;
+  std::vector<flatbuffers::Offset<OperatorCode>> operator_codes_;
+  std::vector<flatbuffers::Offset<Tensor>> tensors_;
+  std::vector<flatbuffers::Offset<Buffer>> buffers_;
 };
 
 TEST(VerifyModel, TestEmptyModel) {
-  FlatBufferBuilder builder;
+  flatbuffers::FlatBufferBuilder builder;
   auto model = CreateModel(builder, /*version=*/TFLITE_SCHEMA_VERSION,
                            /*operator_codes=*/0, /*subgraphs=*/0,
                            /*description=*/0, /*buffers=*/0);
@@ -235,7 +244,7 @@ TEST(VerifyModel, TestCorruptedData) {
 }
 
 TEST(VerifyModel, TestUnsupportedVersion) {
-  FlatBufferBuilder builder;
+  flatbuffers::FlatBufferBuilder builder;
   auto model = CreateModel(builder, /*version=*/1, /*operator_codes=*/0,
                            /*subgraphs=*/0, /*description=*/0, /*buffers=*/0);
   ::tflite::FinishModelBuffer(builder, model);
@@ -247,7 +256,7 @@ TEST(VerifyModel, TestUnsupportedVersion) {
 }
 
 TEST(VerifyModel, TestRandomModificationIsNotAllowed) {
-  FlatBufferBuilder builder;
+  flatbuffers::FlatBufferBuilder builder;
   auto model = CreateModel(builder, /*version=*/TFLITE_SCHEMA_VERSION,
                            /*operator_codes=*/0,
                            /*subgraphs=*/0, /*description=*/0, /*buffers=*/0);
@@ -294,16 +303,16 @@ TEST(VerifyModel, TestIntTensorShapeOverflow) {
 }
 
 TEST(VerifyModel, TensorBufferIsNotValid) {
-  FlatBufferBuilder builder;
+  flatbuffers::FlatBufferBuilder builder;
   std::vector<int> shape = {2, 3};
-  auto tensors = builder.CreateVector(std::vector<Offset<Tensor>>{
+  auto tensors = builder.CreateVector(std::vector<flatbuffers::Offset<Tensor>>{
       CreateTensorDirect(builder, &shape, TensorType_INT32, /*buffer=*/2,
                          "input", /*quantization=*/0)});
-  auto subgraph = std::vector<Offset<SubGraph>>(
+  auto subgraph = std::vector<flatbuffers::Offset<SubGraph>>(
       {CreateSubGraph(builder, tensors, /*inputs=*/0, /*outputs=*/0,
                       /*operators=*/0, builder.CreateString("Main"))});
 
-  auto buffers = builder.CreateVector(std::vector<Offset<Buffer>>{
+  auto buffers = builder.CreateVector(std::vector<flatbuffers::Offset<Buffer>>{
       CreateBuffer(builder, builder.CreateVector(
                                 std::vector<uint8_t>{1, 2, 3, 4, 5, 6})),
   });
@@ -319,6 +328,14 @@ TEST(VerifyModel, TensorBufferIsNotValid) {
   EXPECT_THAT(
       mock_reporter.GetAsString(),
       ::testing::ContainsRegex("Missing 'operators' section in subgraph."));
+}
+
+TEST(VerifyModel, StringTensorIsEmpty) {
+  TfLiteFlatbufferModelBuilder builder;
+  builder.AddTensor({2}, TensorType_STRING, {0x00}, "input");
+  builder.FinishModel({}, {});
+  ASSERT_FALSE(builder.Verify());
+  EXPECT_EQ(builder.GetErrorString(), "String tensor input is invalid (empty)");
 }
 
 TEST(VerifyModel, StringTensorHasInvalidNumString) {
@@ -412,6 +429,19 @@ TEST(VerifyModel, UseUnsupportedCustomOps) {
                   "Unsupported custom op: Not supported, version: 1"));
 }
 
+TEST(VerifyModel, UseUnnamedCustomOps) {
+  TfLiteFlatbufferModelBuilder builder({BuiltinOperator_ADD}, {"NewOp"});
+  builder.AddTensor({2, 2}, TensorType_UINT8, {1, 2, 3, 4}, "input1");
+  builder.AddTensor({2, 2}, TensorType_UINT8, {1, 2, 3, 4}, "input2");
+  builder.AddTensor({2, 2}, TensorType_UINT8, {}, "output");
+  builder.AddOperator({0, 1}, {2}, BuiltinOperator_CUSTOM, "");
+  builder.FinishModel({}, {});
+  ASSERT_FALSE(builder.Verify());
+  EXPECT_THAT(builder.GetErrorString(),
+              ::testing::ContainsRegex(
+                  "Invalid custom op name, cannot be null/empty."));
+}
+
 TEST(VerifyModel, UnpopulatedInputToOp) {
   TfLiteFlatbufferModelBuilder builder({}, {"test"});
   builder.AddOperator({1, 2}, {3}, BuiltinOperator_CUSTOM, "test");
@@ -495,8 +525,8 @@ TEST(VerifyModel, OutputIsAVariable) {
 
 TEST(VerifyModel, OpWithOptionalTensor) {
   TfLiteFlatbufferModelBuilder builder({}, {"test"});
-  builder.AddOperator({kOptionalTensor, 0, 1}, {2}, BuiltinOperator_CUSTOM,
-                      "test");
+  builder.AddOperator({kTfLiteOptionalTensor, 0, 1}, {2},
+                      BuiltinOperator_CUSTOM, "test");
   builder.AddTensor({2, 3}, TensorType_UINT8, {1, 2, 3, 4, 5, 6}, "input");
   builder.AddTensor(
       {2}, TensorType_STRING,
@@ -508,6 +538,201 @@ TEST(VerifyModel, OpWithOptionalTensor) {
   EXPECT_EQ("", builder.GetErrorString());
 }
 
+TEST(VerifyModel, TypedTensorShapeMismatchWithTensorBufferSize) {
+  TfLiteFlatbufferModelBuilder builder;
+  for (int tensor_type = TensorType_MIN; tensor_type <= TensorType_MAX;
+       ++tensor_type) {
+    if (tensor_type == TensorType_STRING) continue;
+    builder.AddTensor({2, 3}, static_cast<TensorType>(tensor_type),
+                      {1, 2, 3, 4}, "input");
+    builder.FinishModel({}, {});
+    ASSERT_FALSE(builder.Verify());
+    EXPECT_THAT(
+        builder.GetErrorString(),
+        ::testing::ContainsRegex("Tensor input requires .* bytes, but is "
+                                 "allocated with 4 bytes buffer"));
+  }
+}
+
+TEST(VerifyModel, TypedTensorShapeMatchesTensorBufferSize) {
+  TfLiteFlatbufferModelBuilder builder;
+  for (int tensor_type = TensorType_MIN; tensor_type <= TensorType_MAX;
+       ++tensor_type) {
+    if (tensor_type == TensorType_STRING ||
+        tensor_type == TensorType_RESOURCE || tensor_type == TensorType_VARIANT)
+      continue;
+    TfLiteType lite_type = kTfLiteNoType;
+    ASSERT_EQ(ConvertTensorType(static_cast<TensorType>(tensor_type),
+                                &lite_type, /*error_reporter=*/nullptr),
+              kTfLiteOk);
+    size_t size_bytes = 0;
+    ASSERT_EQ(GetSizeOfType(/*context=*/nullptr, lite_type, &size_bytes),
+              kTfLiteOk);
+    std::vector<uint8_t> buffer(size_bytes);
+    builder.AddTensor({1}, static_cast<TensorType>(tensor_type), buffer,
+                      "input");
+    builder.FinishModel({}, {});
+    ASSERT_TRUE(builder.Verify());
+  }
+}
+
+TEST(VerifyModel, SimpleValidSparseTensor) {
+  const auto model = FlatBufferModel::BuildFromFile(kSparseTensorTestModel);
+  ASSERT_TRUE(model);
+
+  std::unique_ptr<ModelT> scoped_model;
+  scoped_model.reset(model->GetModel()->UnPack());
+
+  flatbuffers::FlatBufferBuilder builder;
+  auto model_ = Model::Pack(builder, scoped_model.get());
+
+  ::tflite::FinishModelBuffer(builder, model_);
+  MockErrorReporter mock_reporter;
+  MutableOpResolver resolver;
+  TfLiteRegistration fake_op;
+  resolver.AddCustom("FakeOp", &fake_op);
+  Verify(builder.GetBufferPointer(), builder.GetSize(), resolver,
+         &mock_reporter);
+  ASSERT_TRUE(Verify(builder.GetBufferPointer(), builder.GetSize(), resolver,
+                     &mock_reporter));
+}
+
+TEST(VerifyModel, InvalidSparseTensorMissingBlockMap) {
+  const auto model = FlatBufferModel::BuildFromFile(kSparseTensorTestModel);
+  ASSERT_TRUE(model);
+
+  std::unique_ptr<ModelT> scoped_model;
+  scoped_model.reset(model->GetModel()->UnPack());
+
+  auto* tensor = scoped_model->subgraphs[0]->tensors[0].get();
+  tensor->sparsity->block_map = {};
+
+  flatbuffers::FlatBufferBuilder builder;
+  auto model_ = Model::Pack(builder, scoped_model.get());
+
+  ::tflite::FinishModelBuffer(builder, model_);
+  MockErrorReporter mock_reporter;
+  MutableOpResolver resolver;
+  TfLiteRegistration fake_op;
+  resolver.AddCustom("FakeOp", &fake_op);
+  ASSERT_FALSE(Verify(builder.GetBufferPointer(), builder.GetSize(), resolver,
+                      &mock_reporter));
+  EXPECT_THAT(mock_reporter.GetAsString(),
+              ::testing::ContainsRegex("invalid sparsity parameters"));
+}
+
+TEST(VerifyModel, InvalidSparseTensorIndexOutOfBound) {
+  const auto model = FlatBufferModel::BuildFromFile(kSparseTensorTestModel);
+  ASSERT_TRUE(model);
+
+  std::unique_ptr<ModelT> scoped_model;
+  scoped_model.reset(model->GetModel()->UnPack());
+
+  auto* tensor = scoped_model->subgraphs[0]->tensors[0].get();
+  tensor->sparsity->dim_metadata[1]->array_indices.AsUint8Vector()->values[1] =
+      5;
+
+  flatbuffers::FlatBufferBuilder builder;
+  auto model_ = Model::Pack(builder, scoped_model.get());
+
+  ::tflite::FinishModelBuffer(builder, model_);
+  MockErrorReporter mock_reporter;
+  MutableOpResolver resolver;
+  TfLiteRegistration fake_op;
+  resolver.AddCustom("FakeOp", &fake_op);
+  ASSERT_FALSE(Verify(builder.GetBufferPointer(), builder.GetSize(), resolver,
+                      &mock_reporter));
+  EXPECT_THAT(mock_reporter.GetAsString(),
+              ::testing::ContainsRegex("invalid sparsity parameters"));
+}
+
+TEST(VerifyModel, InvalidSparseTensorInvalidBuffer) {
+  const auto model = FlatBufferModel::BuildFromFile(kSparseTensorTestModel);
+  ASSERT_TRUE(model);
+
+  std::unique_ptr<ModelT> scoped_model;
+  scoped_model.reset(model->GetModel()->UnPack());
+
+  // Expected to have 12 numbers in buffer.
+  scoped_model->buffers[1]->data = {0, 1, 2, 3, 4, 5, 6, 7};
+
+  flatbuffers::FlatBufferBuilder builder;
+  auto model_ = Model::Pack(builder, scoped_model.get());
+
+  ::tflite::FinishModelBuffer(builder, model_);
+  MockErrorReporter mock_reporter;
+  MutableOpResolver resolver;
+  TfLiteRegistration fake_op;
+  resolver.AddCustom("FakeOp", &fake_op);
+  ASSERT_FALSE(Verify(builder.GetBufferPointer(), builder.GetSize(), resolver,
+                      &mock_reporter));
+  EXPECT_THAT(mock_reporter.GetAsString(),
+              ::testing::ContainsRegex(
+                  "requires 12 bytes, but is allocated with 8 bytes buffer"));
+}
+
+TEST(VerifyModel, InvalidSparseTensorInvalidTraversalOrder) {
+  const auto model = FlatBufferModel::BuildFromFile(kSparseTensorTestModel);
+  ASSERT_TRUE(model);
+
+  std::unique_ptr<ModelT> scoped_model;
+  scoped_model.reset(model->GetModel()->UnPack());
+
+  auto* tensor = scoped_model->subgraphs[0]->tensors[0].get();
+  // Valid dimensions are (0, 1, 2, 3) in this test model.
+  tensor->sparsity->traversal_order[0] = 10;
+
+  flatbuffers::FlatBufferBuilder builder;
+  auto model_ = Model::Pack(builder, scoped_model.get());
+
+  ::tflite::FinishModelBuffer(builder, model_);
+  MockErrorReporter mock_reporter;
+  MutableOpResolver resolver;
+  TfLiteRegistration fake_op;
+  resolver.AddCustom("FakeOp", &fake_op);
+  ASSERT_FALSE(Verify(builder.GetBufferPointer(), builder.GetSize(), resolver,
+                      &mock_reporter));
+  EXPECT_THAT(mock_reporter.GetAsString(),
+              ::testing::ContainsRegex("invalid sparsity parameters"));
+}
+
+TEST(VerifyModel, ValidSparseTensorBCSC) {
+  const auto model = FlatBufferModel::BuildFromFile(kSparseTensorTestModel);
+  ASSERT_TRUE(model);
+
+  std::unique_ptr<ModelT> scoped_model;
+  scoped_model.reset(model->GetModel()->UnPack());
+
+  auto* tensor = scoped_model->subgraphs[0]->tensors[0].get();
+  tensor->sparsity->traversal_order = {1, 0, 3, 2};
+  tensor->sparsity->block_map = {0, 1};
+  tensor->sparsity->dim_metadata[0]->format = DimensionType_DENSE;
+  tensor->sparsity->dim_metadata[0]->dense_size = 2;
+
+  tensor->sparsity->dim_metadata[1]->format = DimensionType_SPARSE_CSR;
+  tensor->sparsity->dim_metadata[1]->array_segments.AsUint8Vector()->values = {
+      0, 1, 3};
+  tensor->sparsity->dim_metadata[1]->array_indices.AsUint8Vector()->values = {
+      0, 0, 1};
+
+  tensor->sparsity->dim_metadata[2]->format = DimensionType_DENSE;
+  tensor->sparsity->dim_metadata[2]->dense_size = 2;
+  tensor->sparsity->dim_metadata[3]->format = DimensionType_DENSE;
+  tensor->sparsity->dim_metadata[3]->dense_size = 2;
+
+  flatbuffers::FlatBufferBuilder builder;
+  auto model_ = Model::Pack(builder, scoped_model.get());
+
+  ::tflite::FinishModelBuffer(builder, model_);
+  MockErrorReporter mock_reporter;
+  MutableOpResolver resolver;
+  TfLiteRegistration fake_op;
+  resolver.AddCustom("FakeOp", &fake_op);
+  ASSERT_TRUE(Verify(builder.GetBufferPointer(), builder.GetSize(), resolver,
+                     &mock_reporter));
+}
+
+// TODO(b/145614687): Add more tricky test cases for sparse tensor verification.
 // TODO(yichengfan): make up malicious files to test with.
 
 }  // namespace tflite

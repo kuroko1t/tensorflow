@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <utility>
 
+#include "tensorflow/lite/delegates/gpu/common/data_type.h"
 #include "tensorflow/lite/delegates/gpu/common/status.h"
 
 namespace tflite {
@@ -28,12 +29,6 @@ namespace metal {
 
 /// Returns system default device on iOS or Intel GPU on macOS.
 id<MTLDevice> GetBestSupportedMetalDevice();
-
-/// Returns version of the GPU that supports Metal.
-/// @param device Used as a parameter because mac can contain multiple devices.
-/// @discussion Refer to Apple docs for MTLFeatureSet_macOS_GPUFamily1_v1 for details.
-///     1 - Intel integrated GPU the only device that is supported
-int GetMacOsGpuVersion(id<MTLDevice> device);
 
 /// Metal compute shader compilation
 /// @param device The device on which that shader program will be stored.
@@ -45,10 +40,21 @@ int GetMacOsGpuVersion(id<MTLDevice> device);
 ///     both.
 /// @discussion The function autoselects the maximum shader language version supported by the target
 ///     OS. FastMath is enabled.
-::tflite::gpu::Status CreateComputeProgram(id<MTLDevice> device, NSString* code,
-                                           NSString* functionName,
-                                           NSDictionary<NSString*, NSString*>* macros,
-                                           id<MTLComputePipelineState>* program);
+absl::Status CreateComputeProgram(id<MTLDevice> device, NSString* code, NSString* functionName,
+                                  NSDictionary<NSString*, NSString*>* macros,
+                                  id<MTLComputePipelineState>* program);
+
+int PixelFormatToSizeInBytes(MTLPixelFormat pixel_format);
+MTLPixelFormat DataTypeToRGBAPixelFormat(DataType type, bool normalized = false);
+
+void WriteDataToTexture2D(id<MTLTexture> texture, id<MTLDevice> device, const void* data);
+void ReadDataFromTexture2D(id<MTLTexture> texture, id<MTLDevice> device, void* data);
+
+void WriteDataToTexture3D(id<MTLTexture> texture, id<MTLDevice> device, const void* data);
+void ReadDataFromTexture3D(id<MTLTexture> texture, id<MTLDevice> device, void* data);
+
+void WriteDataToTexture2DArray(id<MTLTexture> texture, id<MTLDevice> device, const void* data);
+void ReadDataFromTexture2DArray(id<MTLTexture> texture, id<MTLDevice> device, void* data);
 
 }  // namespace metal
 }  // namespace gpu

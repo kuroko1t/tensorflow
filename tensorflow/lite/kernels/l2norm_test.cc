@@ -12,11 +12,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include <stdint.h>
+
+#include <initializer_list>
+#include <vector>
+
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "tensorflow/lite/interpreter.h"
-#include "tensorflow/lite/kernels/register.h"
+#include "flatbuffers/flatbuffers.h"  // from @flatbuffers
 #include "tensorflow/lite/kernels/test_util.h"
-#include "tensorflow/lite/model.h"
+#include "tensorflow/lite/schema/schema_generated.h"
 
 namespace tflite {
 namespace {
@@ -77,6 +82,23 @@ TEST(L2NormOpTest, SimpleFloatTest) {
               ElementsAreArray({-0.55, 0.3, 0.35, 0.6, -0.35, 0.05}));
 }
 
+TEST(L2NormOpTest, ZerosVectorFloatTest) {
+  L2NormOpModel m({1, 1, 1, 6}, TensorType_FLOAT32,
+                  ActivationFunctionType_NONE);
+  m.SetInput({0, 0, 0, 0, 0, 0});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput<float>(),
+              ElementsAreArray(ArrayFloatNear({0, 0, 0, 0, 0, 0})));
+}
+
+TEST(L2NormOpTest, SimpleFloatWithRankLessThanFourTest) {
+  L2NormOpModel m({1, 6}, TensorType_FLOAT32, ActivationFunctionType_NONE);
+  m.SetInput({-1.1, 0.6, 0.7, 1.2, -0.7, 0.1});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput<float>(),
+              ElementsAreArray({-0.55, 0.3, 0.35, 0.6, -0.35, 0.05}));
+}
+
 TEST(L2NormOpTest, MultipleBatchFloatTest) {
   L2NormOpModel m({3, 1, 1, 6}, TensorType_FLOAT32,
                   ActivationFunctionType_NONE);
@@ -92,6 +114,17 @@ TEST(L2NormOpTest, MultipleBatchFloatTest) {
                   -0.55, 0.3, 0.35, 0.6, -0.35, 0.05,  // batch 2
                   -0.55, 0.3, 0.35, 0.6, -0.35, 0.05,  // batch 3
               }));
+}
+
+TEST(L2NormOpTest, ZerosVectorUint8Test) {
+  L2NormOpModel m({1, 1, 1, 6}, TensorType_UINT8, ActivationFunctionType_NONE);
+
+  m.QuantizeAndPopulate<uint8_t>(m.input(), {0, 0, 0, 0, 0, 0});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput<uint8_t>(),
+              ElementsAreArray({128, 128, 128, 128, 128, 128}));
+  EXPECT_THAT(m.GetDequantizedOutput<uint8_t>(),
+              ElementsAreArray(ArrayFloatNear({0, 0, 0, 0, 0, 0}, 0.1)));
 }
 
 TEST(L2NormOpTest, SimpleUint8Test) {
@@ -117,6 +150,17 @@ TEST(L2NormOpTest, SimpleInt8Test) {
   EXPECT_THAT(m.GetDequantizedOutput<int8_t>(),
               ElementsAreArray(
                   ArrayFloatNear({-0.55, 0.3, 0.35, 0.6, -0.35, 0.05}, 0.1)));
+}
+
+TEST(L2NormOpTest, ZerosVectorInt8Test) {
+  L2NormOpModel m({1, 1, 1, 6}, TensorType_INT8, ActivationFunctionType_NONE);
+
+  m.QuantizeAndPopulate<int8_t>(m.input(), {0, 0, 0, 0, 0, 0});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput<int8_t>(), ElementsAreArray({0, 0, 0, 0, 0, 0}));
+
+  EXPECT_THAT(m.GetDequantizedOutput<int8_t>(),
+              ElementsAreArray(ArrayFloatNear({0, 0, 0, 0, 0, 0}, 0.1)));
 }
 
 TEST(L2NormOpTest, MultipleBatchUint8Test) {
@@ -172,9 +216,3 @@ TEST(L2NormOpTest, MultipleBatchInt8Test) {
 
 }  // namespace
 }  // namespace tflite
-
-int main(int argc, char** argv) {
-  ::tflite::LogToStderr();
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}

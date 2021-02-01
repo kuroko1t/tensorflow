@@ -18,17 +18,18 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import collections
-
 import numpy as np
+import wrapt
 
+from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import tensor_shape
+from tensorflow.python.util.compat import collections_abc
 
 
 def get_json_type(obj):
   """Serializes any object to a JSON-serializable structure.
 
-  Arguments:
+  Args:
       obj: the object to serialize
 
   Returns:
@@ -63,7 +64,16 @@ def get_json_type(obj):
   if isinstance(obj, tensor_shape.TensorShape):
     return obj.as_list()
 
-  if isinstance(obj, collections.Mapping):
+  if isinstance(obj, dtypes.DType):
+    return obj.name
+
+  if isinstance(obj, collections_abc.Mapping):
     return dict(obj)
+
+  if obj is Ellipsis:
+    return {'class_name': '__ellipsis__'}
+
+  if isinstance(obj, wrapt.ObjectProxy):
+    return obj.__wrapped__
 
   raise TypeError('Not JSON Serializable:', obj)

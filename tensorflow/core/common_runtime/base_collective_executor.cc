@@ -21,10 +21,9 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/copy_tensor.h"
 #include "tensorflow/core/common_runtime/device_mgr.h"
 #include "tensorflow/core/common_runtime/dma_helper.h"
-#include "tensorflow/core/common_runtime/hierarchical_tree_broadcaster.h"
 #include "tensorflow/core/common_runtime/process_util.h"
-#include "tensorflow/core/common_runtime/ring_reducer.h"
 #include "tensorflow/core/framework/allocator.h"
+#include "tensorflow/core/framework/cancellation.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
@@ -35,11 +34,23 @@ limitations under the License.
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/macros.h"
+#include "tensorflow/core/platform/refcount.h"
+#include "tensorflow/core/platform/tracing.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/profiler/lib/connected_traceme.h"
+#include "tensorflow/core/profiler/lib/traceme.h"
 
 #define VALUE_IN_DEBUG_STRING false
 
 namespace tensorflow {
+
+namespace {
+bool IsCancelled(CancellationManager* cancel_mgr) {
+  return cancel_mgr != nullptr &&
+         (cancel_mgr->IsCancelled() || cancel_mgr->IsCancelling());
+}
+}  // namespace
+
 /*static*/
 int64 CollectiveAdapter::AlignedChunkElts(int64 elt_bytes, int64 total_elts,
                                           int64 num_chunks) {
@@ -140,6 +151,8 @@ class CollectiveAdapterImpl : public CollectiveAdapter {
 
   Tensor TempChunk(int i) const override {
     AllocationAttributes empty;
+    ScopedMemoryDebugAnnotation op_annotation(
+        "CollectiveAdapterImpl::TempChunk");
     return Tensor(allocator_, dt_, {ChunkElts(i)}, empty);
   }
 
@@ -157,14 +170,10 @@ class CollectiveAdapterImpl : public CollectiveAdapter {
                            ")");
   }
 
-  Tensor Scalar(int v) const override {
-    Tensor t(dt_, TensorShape({}));
-    t.scalar<T>()() = v;
-    return t;
-  }
+  Tensor Scalar(int v) const override { return Tensor(static_cast<T>(v)); }
 
-  Tensor Scalar(Allocator* a) const override {
-    Tensor t(a, dt_, TensorShape({}));
+  Tensor Scalar(Allocator* a, const AllocationAttributes& attr) const override {
+    Tensor t(a, dt_, TensorShape({}), attr);
     return t;
   }
 
@@ -185,6 +194,10 @@ CollectiveAdapter* MakeCollectiveAdapter(Tensor* output, int num_chunks,
                                          Allocator* allocator,
                                          bool align_chunks) {
   switch (output->dtype()) {
+    case DT_HALF:
+      return new CollectiveAdapterImpl<Eigen::half>(output, num_chunks,
+                                                    allocator, align_chunks);
+      break;
     case DT_FLOAT:
       return new CollectiveAdapterImpl<float>(output, num_chunks, allocator,
                                               align_chunks);
@@ -202,7 +215,7 @@ CollectiveAdapter* MakeCollectiveAdapter(Tensor* output, int num_chunks,
                                               align_chunks);
       break;
     default:
-      LOG(FATAL) << "Unsupported type " << output->dtype()
+      LOG(FATAL) << "Unsupported type " << DataTypeString(output->dtype())
                  << " to MakeCollectiveAdapter";
       return nullptr;
   }
@@ -211,34 +224,82 @@ CollectiveAdapter* MakeCollectiveAdapter(Tensor* output, int num_chunks,
 BaseCollectiveExecutor::~BaseCollectiveExecutor() {}
 
 void BaseCollectiveExecutor::StartAbort(const Status& s) {
-  LOG(WARNING) << "BaseCollectiveExecutor::StartAbort " << s;
-  remote_access_->StartAbort(s);
+  Status status;
+  {
+    mutex_lock l(status_mu_);
+    if (!status_.ok()) {
+      VLOG(2) << "BaseCollectiveExecutor already aborted, ignoring StartAbort: "
+              << s;
+      return;
+    }
+    status_ = StatusGroup::MakeDerived(Status(
+        s.code(),
+        absl::StrCat(
+            "Collective ops is aborted by: ", s.error_message(),
+            "\nThe error could be from a previous operation. Restart your "
+            "program to reset.")));
+    status = status_;
+  }
+  LOG(ERROR) << "BaseCollectiveExecutor::StartAbort " << s;
+  cem_->GetParamResolver()->StartAbort(status);
+  remote_access_->StartAbort(status);
+  if (cem_->GetNcclCommunicator() != nullptr) {
+    cem_->GetNcclCommunicator()->StartAbort(status);
+  }
+}
+
+Status BaseCollectiveExecutor::GetStatus(const Status& s) {
+  if (s.ok()) return s;
+  mutex_lock l(status_mu_);
+  // If the collective executor is already aborted, use the aborted status
+  // which is more likely the actual error instead of an artifact of an
+  // abortion.
+  if (!status_.ok()) {
+    VLOG(2) << "Overriding status with collective ops executor status. "
+               "Original status: "
+            << s;
+    return status_;
+  }
+  return s;
 }
 
 void BaseCollectiveExecutor::ExecuteAsync(OpKernelContext* ctx,
                                           const CollectiveParams& col_params,
                                           const string& exec_key,
                                           StatusCallback done) {
-  // On any individual collective Op failure we need to abort the
-  // BufRendezvous so that other Ops in the instance don't hang
-  // waiting for transmissions that will never happen.  Do so after a
-  // delay so that the original error status is more likely to
-  // propagate up, and peers are unlikely to re-create the purged
-  // BufRendezvous by late-arriving requests.
-  StatusCallback done_safe = [this, done](const Status& s) {
-    if (!s.ok()) {
-      Ref();  // Ensure this lasts until the closure executes.
-      SchedNonBlockingClosureAfter(1000000, [this, s] {
-        remote_access_->buf_rendezvous()->StartAbort(s);
-        Unref();
-      });
+  // See CompleteParamsAsync() how done() and the timeout callback interacts.
+  const auto is_callback_called = std::make_shared<std::atomic<bool>>(false);
+  auto done_safe = [this, done, ctx, is_callback_called](const Status& s) {
+    bool called = is_callback_called->exchange(true);
+    if (!called) {
+      if (!s.ok() && !IsCancelled(ctx->cancellation_manager())) {
+        // This is a collective error. Abort CollectiveExecutor so that this
+        // error can propagate to other workers.
+        StartAbort(s);
+      }
+      done(GetStatus(s));
     }
-    done(s);
   };
+  auto timeout_microseconds = static_cast<int64>(
+      col_params.instance.impl_details.timeout_seconds * 1'000'000);
+  if (timeout_microseconds > 0) {
+    // TODO(xldrx): Share the timeout watchdog thread among collectives.
+    SchedNonBlockingClosureAfter(
+        timeout_microseconds, [this, is_callback_called, done] {
+          bool called = is_callback_called->exchange(true);
+          if (!called) {
+            Status status(error::DEADLINE_EXCEEDED,
+                          "Collective has timed out during execution.");
+            StartAbort(status);
+            done(status);
+          }
+        });
+  }
 
   Tensor* output = ctx->mutable_output(0);
   const Tensor* input = (col_params.instance.type == REDUCTION_COLLECTIVE ||
                          col_params.instance.type == GATHER_COLLECTIVE ||
+                         col_params.instance.type == PERMUTE_COLLECTIVE ||
                          (col_params.instance.type == BROADCAST_COLLECTIVE &&
                           col_params.is_source))
                             ? &ctx->input(0)
@@ -250,62 +311,123 @@ void BaseCollectiveExecutor::ExecuteAsync(OpKernelContext* ctx,
     DCHECK_EQ(nullptr, col_impl);
     return;
   }
-  CollectiveContext* col_ctx =
-      new CollectiveContext(this, dev_mgr_, ctx, CtxParams(ctx), col_params,
-                            exec_key, step_id_, input, output);
+  core::ScopedUnref unref(col_impl);
+  auto col_ctx = std::make_shared<CollectiveContext>(
+      this, cem_->GetNcclCommunicator(), dev_mgr_, ctx, CtxParams(ctx),
+      col_params, exec_key, step_id_, input, output);
   status = col_impl->InitializeCollectiveContext(col_ctx);
   if (!status.ok()) {
     done_safe(status);
-    delete col_ctx;
-    delete col_impl;
     return;
   }
-  // Run in an I/O thread, so as not to starve the executor threads.
-  // TODO(b/80529858): Instead of forking every per-device Collective
-  // Op off into its own thread, consider queuing them on a
-  // fixed-size thread-pool dedicated to running CollectiveOps.
-  SchedClosure([col_impl, col_ctx, done_safe]() {
+  // Run on an unbounded work queue that can handle blocking work so as to not
+  // starve executor threads.
+  col_impl->Ref();
+  profiler::TraceMeProducer producer("BaseCollectiveExecutor::ExecuteAsync");
+  RunClosure([col_impl, col_ctx, done_safe, ctx,
+              context_id = producer.GetContextId()]() {
+    core::ScopedUnref unref(col_impl);
+    profiler::TraceMeConsumer consumer(
+        [ctx] {
+          string op = profiler::TraceMeOp(ctx->op_kernel().name_view(),
+                                          ctx->op_kernel().type_string_view());
+          return profiler::TraceMeEncode(std::move(op),
+                                         {{"id", ctx->step_id()}});
+        },
+        context_id);
+    col_impl->Ref();
     col_impl->Run([col_impl, col_ctx, done_safe](const Status& s) {
+      core::ScopedUnref unref(col_impl);
       done_safe(s);
-      delete col_ctx;
-      delete col_impl;
     });
   });
 }
 
 void BaseCollectiveExecutor::CompleteParamsAsync(
-    const string& device, CollectiveParams* cp, CancellationManager* cancel_mgr,
-    StatusCallback done) {
-  cp->instance.gpu_ring_order = *gpu_ring_order_;
-  cem_->GetParamResolver()->CompleteParamsAsync(device, cp, cancel_mgr, done);
+    const DeviceAttributes& device, CollectiveParams* cp,
+    CancellationManager* cancel_mgr, StatusCallback done) {
+  cp->group.gpu_ring_order = *gpu_ring_order_;
+  // We need to make sure that when the timeout callback executes,
+  // CollectiveExecutor and CollectiveExecutorMgr are both alive. After done()
+  // is called, CollectiveExecutorMgr may be destructed and we don't have a way
+  // to keep it without making the ownerships more complicated. Therefore if the
+  // timeout callback executes, done_safe will become a no-op and the timeout
+  // callback is responsible for invoking done() at the end.
+  const auto is_callback_called = std::make_shared<std::atomic<bool>>(false);
+  auto trace_id =
+      profiler::TraceMe::ActivityStart("CollectiveExecutor::CompleteParams");
+  auto done_safe = [this, is_callback_called, cancel_mgr, trace_id,
+                    done](const Status& s) {
+    profiler::TraceMe::ActivityEnd(trace_id);
+    bool called = is_callback_called->exchange(true);
+    if (!called) {
+      if (!s.ok() && !IsCancelled(cancel_mgr)) {
+        // This is a collective error. Abort CollectiveExecutor so that this
+        // error can propagate to other workers.
+        StartAbort(s);
+      }
+      done(GetStatus(s));
+    }
+  };
+  auto timeout_microseconds =
+      static_cast<int64>(cp->instance.impl_details.timeout_seconds * 1'000'000);
+  if (timeout_microseconds > 0) {
+    // TODO(xldrx): Share the timeout watchdog thread among collectives.
+    SchedNonBlockingClosureAfter(
+        timeout_microseconds, [this, is_callback_called, done]() {
+          bool called = is_callback_called->exchange(true);
+          if (!called) {
+            Status status(
+                error::DEADLINE_EXCEEDED,
+                "Collective has timed out waiting for other workers.");
+            StartAbort(status);
+            done(status);
+          }
+        });
+  }
+  cem_->GetParamResolver()->CompleteParamsAsync(device, cp, cancel_mgr,
+                                                done_safe);
 }
 
 Status BaseCollectiveExecutor::CreateCollective(
     const CollectiveParams& col_params,
     CollectiveImplementationInterface** col_impl) {
+  VLOG(2) << "CreateCollective type "
+          << DataTypeString(col_params.instance.data_type) << " name "
+          << col_params.instance.impl_details.collective_name;
   *col_impl = nullptr;
-  Status status;
   switch (col_params.instance.data_type) {
-    case DT_INT32:
-      if (col_params.group.device_type == DEVICE_GPU) {
-        status = errors::Internal(
-            "CollectiveImplementation does not support datatype DT_INT32 on "
-            "DEVICE_GPU");
+    case DT_BOOL:
+      if (col_params.instance.type == BROADCAST_COLLECTIVE) {
+        return CollectiveRegistry::Lookup(
+            col_params.instance.impl_details.collective_name, col_impl);
+      } else {
+        return errors::Internal(
+            "No collective other than broadcast supports DT_BOOL");
       }
-      TF_FALLTHROUGH_INTENDED;
+    case DT_INT32:
+      if (col_params.group.device_type == DEVICE_GPU &&
+          col_params.instance.type == REDUCTION_COLLECTIVE) {
+        // TODO(b/139421603): enable int32 all-reduce on GPU.
+        return errors::Internal(
+            "Collective all-reduce does not support datatype DT_INT32 on "
+            "DEVICE_GPU");
+      } else {
+        return CollectiveRegistry::Lookup(
+            col_params.instance.impl_details.collective_name, col_impl);
+      }
+    case DT_HALF:
     case DT_FLOAT:
     case DT_DOUBLE:
     case DT_INT64: {
-      status = CollectiveRegistry::Lookup(
+      return CollectiveRegistry::Lookup(
           col_params.instance.impl_details.collective_name, col_impl);
-      break;
     }
     default:
-      status = errors::Internal(
+      return errors::Internal(
           "CollectiveImplementation does not support datatype ",
-          col_params.instance.data_type);
+          DataTypeString(col_params.instance.data_type));
   }
-  return status;
 }
 
 bool BaseCollectiveExecutor::CheckDependencies(
@@ -330,13 +452,14 @@ void BaseCollectiveExecutor::WaitForDependencies(
   VLOG(1) << "Unblocking collective " << col_params.ToString();
 }
 
-void BaseCollectiveExecutor::Launched(const CollectiveParams& col_params) {
+void BaseCollectiveExecutor::UnblockDependencies(
+    const CollectiveParams& col_params) {
   mutex_lock l(launch_mu_);
   if (launched_.find(col_params.instance.instance_key) == launched_.end()) {
     const string& task_name =
-        col_params.instance.task_names[col_params.default_rank];
+        col_params.group.task_names[col_params.default_rank];
     const int32 num_devices =
-        col_params.instance.num_devices_per_task.at(task_name);
+        col_params.group.num_devices_per_task.at(task_name);
     launched_[col_params.instance.instance_key] = num_devices;
   }
   if (--launched_[col_params.instance.instance_key] == 0) {

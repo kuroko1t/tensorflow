@@ -14,12 +14,15 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/lite/stderr_reporter.h"
 
+#include <stdarg.h>
+
+#include "tensorflow/lite/core/api/error_reporter.h"
 #include "tensorflow/lite/minimal_logging.h"
 
 namespace tflite {
 
 int StderrReporter::Report(const char* format, va_list args) {
-  logging_internal::MinimalLogger::VLog(TFLITE_LOG_ERROR, format, args);
+  logging_internal::MinimalLogger::LogFormatted(TFLITE_LOG_ERROR, format, args);
   return 0;
 }
 

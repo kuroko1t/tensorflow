@@ -20,7 +20,6 @@ from __future__ import print_function
 
 from absl.testing import parameterized
 
-from tensorflow.contrib.tpu.python.tpu import tpu_feed
 from tensorflow.python import summary
 from tensorflow.python.compiler.xla import xla
 from tensorflow.python.eager import def_function
@@ -35,6 +34,7 @@ from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import state_ops
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.platform import test
+from tensorflow.python.tpu import tpu_feed
 
 
 _TRAIN = model_fn_lib.ModeKeys.TRAIN
@@ -112,7 +112,7 @@ class XLACompileContextTest(test.TestCase, parameterized.TestCase):
 
     context = self.create_test_xla_compile_context()
     context.Enter()
-    with self.assertRaisesRegexp(
+    with self.assertRaisesRegex(
         NotImplementedError, 'Non-resource Variables are not supported inside '
         r'XLA computations \(operator name: Assign\)'):
       state_ops.assign(a, a + 1)
@@ -126,8 +126,8 @@ class XLACompileContextTest(test.TestCase, parameterized.TestCase):
 
     context2 = self.create_test_xla_compile_context()
     context2.Enter()
-    with self.assertRaisesRegexp(ValueError,
-                                 'XLA compiled computations cannot be nested'):
+    with self.assertRaisesRegex(ValueError,
+                                'XLA compiled computations cannot be nested'):
       constant_op.constant(1)
     context2.Exit()
     context1.Exit()
@@ -217,17 +217,18 @@ class XLACompileContextTest(test.TestCase, parameterized.TestCase):
 class XlaCompileTest(test.TestCase):
 
   @test_util.run_v2_only
+  @test_util.disable_tfrt(
+      'Legacy XLA test. It depends on EncapsulateXlaComputationsPass.')
   def test_xla_compile_eager(self):
     """Tests that xla.compile raises proper exception when used eagerly."""
 
-    def computation():
-      return 1
+    def computation(a, b):
+      return a + b
 
-    with self.assertRaisesRegexp(
-        RuntimeError, 'xla.experimental.compile is not supported when eager '
-        'execution is enabled. Try use it inside tf.function.'):
-      xla.compile(computation)
+    self.assertEqual(self.evaluate(xla.compile(computation, [1, 2])[0]), 3)
 
+  @test_util.disable_tfrt(
+      'Legacy XLA test. It depends on EncapsulateXlaComputationsPass.')
   def test_xla_compile_in_function(self):
     """Tests that xla.compile works in tf.function."""
 
@@ -241,6 +242,8 @@ class XlaCompileTest(test.TestCase):
 
     self.assertEqual(self.evaluate(func_wrapper(1))[0], 2)
 
+  @test_util.disable_tfrt(
+      'Legacy XLA test. It depends on EncapsulateXlaComputationsPass.')
   def test_xla_compile_write_variable_in_function(self):
     """Tests that xla.compile works with variable in tf.function."""
     a = variable_scope.get_variable(

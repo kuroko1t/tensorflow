@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/grappler/op_types.h"
+
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/types.h"
@@ -27,7 +28,10 @@ namespace tensorflow {
 namespace grappler {
 
 bool IsAdd(const NodeDef& node) {
-  if (node.op() == "AddV2" || node.op() == "Add") {
+  if (node.op() == "AddV2") {
+    return true;
+  }
+  if (node.op() == "Add") {
     DataType type = node.attr().at("T").type();
     return type != DT_STRING;
   }
@@ -47,6 +51,15 @@ bool IsAnyDiv(const NodeDef& node) {
          node.op() == "FloorDiv" || node.op() == "TruncateDiv";
 }
 
+bool IsAnyBatchMatMul(const NodeDef& node) {
+  return node.op() == "BatchMatMul" || node.op() == "BatchMatMulV2";
+}
+
+bool IsAnyMatMul(const NodeDef& node) {
+  return node.op() == "MatMul" || node.op() == "SparseMatMul" ||
+         IsAnyBatchMatMul(node) || IsQuantizedMatMul(node);
+}
+
 bool IsAnyMax(const NodeDef& node) {
   const auto& op = node.op();
   return op == "Max" || op == "SegmentMax" || op == "UnsortedSegmentMax";
@@ -61,6 +74,15 @@ bool IsAnyMaxPool(const NodeDef& node) {
 bool IsAnyMin(const NodeDef& node) {
   const auto& op = node.op();
   return op == "Min" || op == "SegmentMin" || op == "UnsortedSegmentMin";
+}
+
+bool IsAnySparseSegmentReduction(const NodeDef& node) {
+  const auto& op = node.op();
+  return op == "SparseSegmentSum" || op == "SparseSegmentSumWithNumSegments" ||
+         op == "SparseSegmentMean" ||
+         op == "SparseSegmentMeanWithNumSegments" ||
+         op == "SparseSegmentSqrtN" ||
+         op == "SparseSegmentSqrtNWithNumSegments";
 }
 
 bool IsApproximateEqual(const NodeDef& node) {
@@ -91,9 +113,13 @@ bool IsBiasAdd(const NodeDef& node) {
   return node.op() == "BiasAdd" || node.op() == "BiasAddV1";
 }
 
+bool IsBiasAddV2(const NodeDef& node) { return node.op() == "BiasAdd"; }
+
 bool IsBiasAddGrad(const NodeDef& node) { return node.op() == "BiasAddGrad"; }
 
 bool IsBitcast(const NodeDef& node) { return node.op() == "Bitcast"; }
+
+bool IsBroadcastTo(const NodeDef& node) { return node.op() == "BroadcastTo"; }
 
 bool IsCast(const NodeDef& node) { return node.op() == "Cast"; }
 
@@ -143,8 +169,10 @@ bool IsControlFlow(const NodeDef& node) {
          node.op() == "Exit" ||
          node.op() == "LoopCond" ||
          node.op() == "Merge" ||
+         node.op() == "_XlaMerge" ||
          node.op() == "NextIteration" ||
-         node.op() == "Switch";
+         node.op() == "Switch" ||
+         node.op() == "_SwitchN";
   // clang-format on
 }
 
@@ -159,6 +187,14 @@ bool IsConv2DBackpropInput(const NodeDef& node) {
 }
 
 bool IsConv3D(const NodeDef& node) { return node.op() == "Conv3D"; }
+
+bool IsConv3DBackpropFilterV2(const NodeDef& node) {
+  return node.op() == "Conv3DBackpropFilterV2";
+}
+
+bool IsConv3DBackpropInputV2(const NodeDef& node) {
+  return node.op() == "Conv3DBackpropInputV2";
+}
 
 bool IsDepthwiseConv2dNative(const NodeDef& node) {
   return node.op() == "DepthwiseConv2dNative";
@@ -211,7 +247,15 @@ bool IsElementWiseMonotonic(const NodeDef& node, bool* is_non_decreasing) {
   return false;
 }
 
+bool IsElu(const NodeDef& node) { return node.op() == "Elu"; }
+
 bool IsEluGrad(const NodeDef& node) { return node.op() == "EluGrad"; }
+
+bool IsQuantizationEmulation(const NodeDef& node) {
+  const auto& op = node.op();
+  return absl::StartsWith(op, "QuantizeAndDequantize") ||
+         absl::StartsWith(op, "FakeQuantWithMinMax");
+}
 
 bool IsEnter(const NodeDef& node) {
   const auto& op = node.op();
@@ -237,12 +281,23 @@ bool IsFloorMod(const NodeDef& node) { return node.op() == "FloorMod"; }
 
 bool IsFusedBatchNorm(const NodeDef& node) {
   const auto& op = node.op();
-  return op == "FusedBatchNorm" || op == "FusedBatchNormV2";
+  return op == "FusedBatchNorm" || op == "FusedBatchNormV2" ||
+         op == "FusedBatchNormV3";
+}
+
+bool IsFusedBatchNormEx(const NodeDef& node) {
+  return node.op() == "_FusedBatchNormEx";
 }
 
 bool IsFusedBatchNormGrad(const NodeDef& node) {
   const auto& op = node.op();
-  return op == "FusedBatchNormGrad" || op == "FusedBatchNormGradV2";
+  return op == "FusedBatchNormGrad" || op == "FusedBatchNormGradV2" ||
+         op == "FusedBatchNormGradV3";
+}
+
+bool IsGather(const NodeDef& node) {
+  const auto& op = node.op();
+  return op == "Gather" || op == "GatherV2";
 }
 
 bool IsGreater(const NodeDef& node) { return node.op() == "Greater"; }
@@ -287,6 +342,12 @@ bool IsImmutableConst(const NodeDef& node) {
 
 bool IsInvGrad(const NodeDef& node) { return node.op() == "InvGrad"; }
 
+bool IsLeakyRelu(const NodeDef& node) { return node.op() == "LeakyRelu"; }
+
+bool IsLeakyReluGrad(const NodeDef& node) {
+  return node.op() == "LeakyReluGrad";
+}
+
 bool IsLess(const NodeDef& node) { return node.op() == "Less"; }
 
 bool IsLessEqual(const NodeDef& node) { return node.op() == "LessEqual"; }
@@ -299,11 +360,9 @@ bool IsLogicalNot(const NodeDef& node) { return node.op() == "LogicalNot"; }
 
 bool IsLogicalOr(const NodeDef& node) { return node.op() == "LogicalOr"; }
 
-bool IsMatMul(const NodeDef& node) {
-  const auto& op = node.op();
-  return op == "MatMul" || op == "BatchMatMul" || op == "SparseMatMul" ||
-         IsQuantizedMatMul(node);
-}
+bool IsLoopCond(const NodeDef& node) { return node.op() == "LoopCond"; }
+
+bool IsMatMul(const NodeDef& node) { return node.op() == "MatMul"; }
 
 bool IsMax(const NodeDef& node) { return node.op() == "Max"; }
 
@@ -315,7 +374,7 @@ bool IsMean(const NodeDef& node) { return node.op() == "Mean"; }
 
 bool IsMerge(const NodeDef& node) {
   const auto& op = node.op();
-  return op == "Merge" || op == "RefMerge";
+  return op == "Merge" || op == "RefMerge" || op == "_XlaMerge";
 }
 
 bool IsMin(const NodeDef& node) { return node.op() == "Min"; }
@@ -392,6 +451,10 @@ bool IsReadVariableOp(const NodeDef& node) {
   return node.op() == "ReadVariableOp";
 }
 
+bool IsReadVariablesOp(const NodeDef& node) {
+  return node.op() == "_ReadVariablesOp";
+}
+
 bool IsReal(const NodeDef& node) { return node.op() == "Real"; }
 
 bool IsRealDiv(const NodeDef& node) { return node.op() == "RealDiv"; }
@@ -411,6 +474,8 @@ bool IsReduction(const NodeDef& node) {
 }
 
 bool IsRelu(const NodeDef& node) { return node.op() == "Relu"; }
+
+bool IsRelu6(const NodeDef& node) { return node.op() == "Relu6"; }
 
 bool IsReluGrad(const NodeDef& node) { return node.op() == "ReluGrad"; }
 
@@ -437,7 +502,9 @@ bool IsRsqrt(const NodeDef& node) { return node.op() == "Rsqrt"; }
 
 bool IsRsqrtGrad(const NodeDef& node) { return node.op() == "RsqrtGrad"; }
 
-bool IsSelect(const NodeDef& node) { return node.op() == "Select"; }
+bool IsSelect(const NodeDef& node) {
+  return node.op() == "Select" || node.op() == "SelectV2";
+}
 
 bool IsSeluGrad(const NodeDef& node) { return node.op() == "SeluGrad"; }
 
@@ -515,12 +582,14 @@ bool IsSum(const NodeDef& node) { return node.op() == "Sum"; }
 
 bool IsSwitch(const NodeDef& node) {
   const auto& op = node.op();
-  return op == "Switch" || op == "RefSwitch";
+  return op == "_SwitchN" || op == "Switch" || op == "RefSwitch";
 }
 
 bool IsSymbolicGradient(const NodeDef& node) {
   return node.op() == "SymbolicGradient";
 }
+
+bool IsTanh(const NodeDef& node) { return node.op() == "Tanh"; }
 
 bool IsTanhGrad(const NodeDef& node) { return node.op() == "TanhGrad"; }
 
@@ -564,12 +633,18 @@ bool IsTruncateDiv(const NodeDef& node) { return node.op() == "TruncateDiv"; }
 
 bool IsTruncateMod(const NodeDef& node) { return node.op() == "TruncateMod"; }
 
+bool IsUnique(const NodeDef& node) {
+  const auto& op = node.op();
+  return op == "Unique" || op == "UniqueV2";
+}
+
 bool IsUnpack(const NodeDef& node) { return node.op() == "Unpack"; }
 
 bool IsVariable(const NodeDef& node) {
   const auto& op = node.op();
   return op == "Variable" || op == "VariableV2" || op == "AutoReloadVariable" ||
-         op == "VarHandleOp" || op == "ReadVariableOp";
+         op == "VarHandleOp" || op == "ReadVariableOp" ||
+         op == "_VarHandlesOp" || op == "_ReadVariablesOp";
 }
 
 bool IsWhile(const NodeDef& node) {
@@ -669,7 +744,7 @@ bool IsFreeOfSideEffect(const NodeDef& node) {
 
 bool ModifiesInputsInPlace(const NodeDef& node) {
   // Some nodes do in-place updates on regular tensor inputs.
-  string op_name = node.op();
+  const string& op_name = node.op();
 
   // Ops that modify resource variables effectively modify one of their inputs.
   if (op_name == "AssignVariableOp" || op_name == "AssignAddVariableOp" ||
@@ -680,8 +755,10 @@ bool ModifiesInputsInPlace(const NodeDef& node) {
     return false;
   }
 
-  std::transform(op_name.begin(), op_name.end(), op_name.begin(), ::tolower);
-  if (str_util::StrContains(op_name, "inplace")) {
+  string lower_op_name = op_name;
+  std::transform(lower_op_name.begin(), lower_op_name.end(),
+                 lower_op_name.begin(), ::tolower);
+  if (absl::StrContains(lower_op_name, "inplace")) {
     return true;
   }
   return GetBoolAttr(node, "in_place") || GetBoolAttr(node, "inplace");
@@ -836,19 +913,25 @@ bool NeverForwardsInputs(const NodeDef& node) {
       (new gtl::FlatSet<string>{"ArgMax",
                                 "ArgMin",
                                 "AudioSpectrogram",
+                                "AvgPool",
                                 "BatchMatMul",
+                                "BatchMatMulV2",
+                                "BatchNormWithGlobalNormalization",
                                 "BatchToSpace",
                                 "BatchToSpaceND",
                                 "Bincount",
                                 "BroadcastArgs",
                                 "BroadcastGradientArgs",
+                                "Bucketize",
                                 "CTCBeamSearchDecoder",
                                 "CTCGreedyDecoder",
                                 "CTCLoss",
+                                "CompareAndBitpack",
                                 "ComplexAbs",
                                 "Concat",
                                 "ConcatOffset",
                                 "ConcatV2",
+                                "Conv2D",
                                 "Copy",
                                 "CopyHost",
                                 "Cross",
@@ -857,12 +940,14 @@ bool NeverForwardsInputs(const NodeDef& node) {
                                 "CudnnRNNBackpropV2",
                                 "CudnnRNNBackpropV3",
                                 "CudnnRNNCanonicalToParams",
+                                "CudnnRNNCanonicalToParamsV2",
                                 "CudnnRNNParamsSize",
                                 "CudnnRNNParamsToCanonical",
+                                "CudnnRNNParamsToCanonicalV2",
                                 "CudnnRNNV2",
                                 "CudnnRNNV3",
-                                "CumSum",
                                 "CumProd",
+                                "CumSum",
                                 "DebugNanCount",
                                 "DebugNumericSummary",
                                 "DecodeProtoV2",
@@ -892,12 +977,24 @@ bool NeverForwardsInputs(const NodeDef& node) {
                                 "MatMul",
                                 "MatrixDiag",
                                 "MatrixDiagPart",
+                                "MatrixDiagPartV2",
+                                "MatrixDiagV2",
                                 "Mfcc",
+                                "Multinomial",
                                 "OneHot",
                                 "Pack",
+                                "ParameterizedTruncatedNormal",
                                 "PopulationCount",
+                                "RandomGamma",
+                                "RandomPoisson",
+                                "RandomPoissonV2",
+                                "RandomStandardNormal",
+                                "RandomUniform",
+                                "RandomUniformInt",
                                 "Range",
                                 "Rank",
+                                "RequantizationRange",
+                                "Requantize",
                                 "ReverseSequence",
                                 "Shape",
                                 "ShapeN",
@@ -908,6 +1005,7 @@ bool NeverForwardsInputs(const NodeDef& node) {
                                 "SparseMatMul",
                                 "Split",
                                 "SplitV",
+                                "TruncatedNormal",
                                 "Unique",
                                 "UniqueV2",
                                 "UniqueWithCounts",
@@ -915,30 +1013,14 @@ bool NeverForwardsInputs(const NodeDef& node) {
                                 "Unpack",
                                 "UnravelIndex",
                                 "UpperBound",
-                                "Where",
-                                "CompareAndBitpack",
-                                "Requantize",
-                                "RequantizationRange",
-                                "Bucketize",
-                                "AvgPool",
-                                "BatchNormWithGlobalNormalization",
-                                "FusedBatchNorm",
-                                "FusedBatchNormV2",
-                                "Conv2D",
-                                "RandomUniform",
-                                "RandomUniformInt",
-                                "RandomStandardNormal",
-                                "ParameterizedTruncatedNormal",
-                                "TruncatedNormal",
-                                "Multinomial",
-                                "RandomGamma",
-                                "RandomPoisson",
-                                "RandomPoissonV2"}));
+                                "Where"}));
   const string& op_name = node.op();
   return kNonForwardingOps->count(op_name) > 0 ||
-         str_util::StrContains(op_name, "Segment") ||
-         str_util::StartsWith(op_name, "Quantize");
+         absl::StrContains(op_name, "Segment") ||
+         absl::StartsWith(op_name, "Quantize");
 }
+
+bool IsXlaLaunch(const NodeDef& node) { return node.op() == "XlaLaunch"; }
 
 }  // namespace grappler
 }  // end namespace tensorflow

@@ -15,8 +15,6 @@ limitations under the License.
 
 #include "tensorflow/lite/minimal_logging.h"
 
-#include <string>
-
 #include <gtest/gtest.h>
 
 namespace tflite {
@@ -50,6 +48,39 @@ TEST(MinimalLogging, UnknownSeverity) {
   TFLITE_LOG_PROD(static_cast<LogSeverity>(-1), "Three");
   EXPECT_EQ("<Unknown severity>: Three\n",
             testing::internal::GetCapturedStderr());
+}
+
+TEST(MinimalLogging, Once) {
+  testing::internal::CaptureStderr();
+  for (int i = 0; i < 10; ++i) {
+    TFLITE_LOG_PROD_ONCE(TFLITE_LOG_INFO, "Count: %d", i);
+  }
+  EXPECT_EQ("INFO: Count: 0\n", testing::internal::GetCapturedStderr());
+}
+
+TEST(MinimalLogging, Debug) {
+  testing::internal::CaptureStderr();
+  TFLITE_LOG(TFLITE_LOG_INFO, "Foo");
+  TFLITE_LOG(TFLITE_LOG_WARNING, "Bar");
+  TFLITE_LOG(TFLITE_LOG_ERROR, "Baz");
+#ifndef NDEBUG
+  EXPECT_EQ("INFO: Foo\nWARNING: Bar\nERROR: Baz\n",
+            testing::internal::GetCapturedStderr());
+#else
+  EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+#endif
+}
+
+TEST(MinimalLogging, DebugOnce) {
+  testing::internal::CaptureStderr();
+  for (int i = 0; i < 10; ++i) {
+    TFLITE_LOG_ONCE(TFLITE_LOG_INFO, "Count: %d", i);
+  }
+#ifndef NDEBUG
+  EXPECT_EQ("INFO: Count: 0\n", testing::internal::GetCapturedStderr());
+#else
+  EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+#endif
 }
 
 }  // namespace tflite

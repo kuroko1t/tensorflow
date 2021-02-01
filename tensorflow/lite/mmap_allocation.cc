@@ -14,9 +14,9 @@ limitations under the License.
 ==============================================================================*/
 
 #include <fcntl.h>
+#include <stddef.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "tensorflow/lite/allocation.h"
@@ -26,7 +26,8 @@ namespace tflite {
 
 MMAPAllocation::MMAPAllocation(const char* filename,
                                ErrorReporter* error_reporter)
-    : Allocation(error_reporter), mmapped_buffer_(MAP_FAILED) {
+    : Allocation(error_reporter, Allocation::Type::kMMap),
+      mmapped_buffer_(MAP_FAILED) {
   mmap_fd_ = open(filename, O_RDONLY);
   if (mmap_fd_ == -1) {
     error_reporter_->Report("Could not open '%s'.", filename);

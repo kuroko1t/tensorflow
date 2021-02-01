@@ -13,8 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#if GOOGLE_CUDA
-#if GOOGLE_TENSORRT
+#if GOOGLE_CUDA && GOOGLE_TENSORRT
 
 #include "tensorflow/core/framework/common_shape_fns.h"
 #include "tensorflow/core/framework/op.h"
@@ -33,13 +32,12 @@ namespace tensorflow {
 // key to cache the instantiated functions for different executor subgraphs.
 REGISTER_OP("TRTEngineOp")
     .Attr("serialized_segment: string")
-    .Attr("input_shapes: list(shape)")
-    .Attr("output_shapes: list(shape)")
-    .Attr("segment_funcdef_name: string")
+    .Attr("segment_func: func = {}")
     .Attr("InT: list({int8,float16,float32,int32})")
     .Attr("OutT: list({int8,float16,float32,int32})")
-    .Attr("cached_engine_batches: list(int) >= 0 = []")
+    .Attr("input_shapes: list(shape) = []")
     .Attr("max_cached_engines_count: int = 1")
+    .Attr("max_batch_size: int = 1")
     .Attr("workspace_size_bytes: int")
     .Attr("precision_mode: {'FP32', 'FP16', 'INT8'}")
     .Attr("calibration_data: string = ''")
@@ -54,9 +52,11 @@ REGISTER_OP("TRTEngineOp")
     // inference function as a workaround.
     .SetShapeFn(shape_inference::UnknownShape)
     // Deprecated attributes.
+    .Attr("segment_funcdef_name: string = ''")
+    .Attr("cached_engine_batches: list(int) >= 0 = []")
     .Attr("fixed_input_size: bool = true")
+    .Attr("output_shapes: list(shape) = []")
     .Attr("static_engine: bool = true");
 }  // namespace tensorflow
 
-#endif  // GOOGLE_TENSORRT
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA && GOOGLE_TENSORRT

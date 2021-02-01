@@ -22,6 +22,7 @@ limitations under the License.
 #include "tensorflow/core/lib/core/notification.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
+#include "tensorflow/core/nccl/collective_communicator.h"
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/public/session_options.h"
 
@@ -40,14 +41,15 @@ class CollectiveExecutorMgrTest : public ::testing::Test {
     device_count->insert({"CPU", NUM_DEVS});
     std::vector<std::unique_ptr<Device>> devices;
     TF_CHECK_OK(DeviceFactory::AddDevices(options, task_name, &devices));
-    device_mgr_.reset(new DeviceMgr(std::move(devices)));
+    device_mgr_ = absl::make_unique<StaticDeviceMgr>(std::move(devices));
     std::unique_ptr<DeviceResolverInterface> drl(
         new DeviceResolverLocal(device_mgr_.get()));
     std::unique_ptr<ParamResolverInterface> prl(
         new CollectiveParamResolverLocal(cp, device_mgr_.get(), drl.get(),
                                          task_name));
     cme_.reset(new CollectiveExecutorMgr(cp, device_mgr_.get(), std::move(drl),
-                                         std::move(prl)));
+                                         std::move(prl),
+                                         MaybeCreateNcclCommunicator()));
   }
 
   std::unique_ptr<CollectiveExecutorMgr> cme_;

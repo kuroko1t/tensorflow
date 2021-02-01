@@ -14,13 +14,14 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/lite/tools/optimize/calibration/calibration_reader.h"
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/memory/memory.h"
 
 namespace tflite {
 namespace optimize {
 namespace calibration {
 TfLiteStatus CalibrationReader::GetTensorStatsAsMap(
-    std::unordered_map<int, CalibrationStats>* tensor_id_to_stats_map) const {
+    absl::flat_hash_map<int, CalibrationStats>* tensor_id_to_stats_map) const {
   tensor_id_to_stats_map->clear();
   for (const auto& tensorid_stat : logger_->GetCalibrationValues()) {
     auto minmax = tensorid_stat.second;
@@ -32,7 +33,8 @@ TfLiteStatus CalibrationReader::GetTensorStatsAsMap(
   return kTfLiteOk;
 }
 
-TfLiteStatus CalibrationReader::AddCalibrationToModel(ModelT* model) const {
+TfLiteStatus CalibrationReader::AddCalibrationToModel(ModelT* model,
+                                                      bool update) const {
   if (!model || model->subgraphs.empty()) {
     return kTfLiteError;
   }
@@ -41,6 +43,15 @@ TfLiteStatus CalibrationReader::AddCalibrationToModel(ModelT* model) const {
     auto minmax = tensorid_stat.second;
     float min, max;
     TF_LITE_ENSURE_STATUS(minmax.Get(&min, &max));
+    if (update) {
+      auto tensor = subgraph->tensors[tensorid_stat.first].get();
+      if (tensor->quantization) {
+        const float existing_min = tensor->quantization->min[0];
+        const float existing_max = tensor->quantization->max[0];
+        min = min < existing_min ? min : existing_min;
+        max = max > existing_max ? max : existing_max;
+      }
+    }
     auto quant_params = absl::make_unique<tflite::QuantizationParametersT>();
     quant_params->min.push_back(min);
     quant_params->max.push_back(max);

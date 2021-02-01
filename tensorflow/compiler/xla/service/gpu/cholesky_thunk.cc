@@ -31,13 +31,13 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 
-CholeskyThunk::CholeskyThunk(const CholeskyOptions& options,
+CholeskyThunk::CholeskyThunk(ThunkInfo thunk_info,
+                             const CholeskyOptions& options,
                              BufferAllocation::Slice a_buffer,
                              BufferAllocation::Slice workspace_buffer,
                              BufferAllocation::Slice info_buffer,
-                             PrimitiveType type, int64 batch_size, int64 n,
-                             const HloInstruction* hlo)
-    : Thunk(Kind::kCholesky, hlo),
+                             PrimitiveType type, int64 batch_size, int64 n)
+    : Thunk(Kind::kCholesky, thunk_info),
       uplo_(options.lower() ? se::blas::UpperLower::kLower
                             : se::blas::UpperLower::kUpper),
       a_buffer_(a_buffer),
@@ -45,14 +45,10 @@ CholeskyThunk::CholeskyThunk(const CholeskyOptions& options,
       info_buffer_(info_buffer),
       type_(type),
       batch_size_(batch_size),
-      a_batch_stride_(n * n *
-                      ShapeUtil::ByteSizeOfPrimitiveType(
-                          hlo->operand(0)->shape().element_type())),
+      a_batch_stride_(n * n * ShapeUtil::ByteSizeOfPrimitiveType(type)),
       n_(n) {}
 
-Status CholeskyThunk::ExecuteOnStream(
-    const BufferAllocations& buffer_allocations, se::Stream* stream,
-    HloExecutionProfiler* profiler) {
+Status CholeskyThunk::ExecuteOnStream(const ExecuteParams& params) {
   VLOG(3) << "type=" << PrimitiveType_Name(type_)
           << " uplo=" << se::blas::UpperLowerString(uplo_)
           << " batch_size=" << batch_size_ << " n=" << n_
@@ -63,20 +59,20 @@ Status CholeskyThunk::ExecuteOnStream(
   CusolverContext* context;
   {
     tensorflow::mutex_lock lock(mu_);
-    auto result = contexts_.emplace(stream, CusolverContext());
+    auto result = contexts_.emplace(params.stream, CusolverContext());
     if (result.second) {
       TF_ASSIGN_OR_RETURN(result.first->second,
-                          CusolverContext::Create(stream));
+                          CusolverContext::Create(params.stream));
     }
     context = &result.first->second;
   }
 
   char* a_base = static_cast<char*>(
-      buffer_allocations.GetDeviceAddress(a_buffer_).opaque());
+      params.buffer_allocations->GetDeviceAddress(a_buffer_).opaque());
   int* info_base = static_cast<int*>(
-      buffer_allocations.GetDeviceAddress(info_buffer_).opaque());
+      params.buffer_allocations->GetDeviceAddress(info_buffer_).opaque());
   se::DeviceMemoryBase workspace_data =
-      buffer_allocations.GetDeviceAddress(workspace_buffer_);
+      params.buffer_allocations->GetDeviceAddress(workspace_buffer_);
   for (int64 i = 0; i < batch_size_; ++i) {
     se::DeviceMemoryBase a_data =
         se::DeviceMemoryBase(a_base + i * a_batch_stride_, a_batch_stride_);

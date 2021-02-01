@@ -22,6 +22,8 @@ option cc_enable_arenas = true;
 // Primitive types are the individual values that can be held in rectangular
 // multidimensional arrays. A description of the rectangular multidimensional
 // array dimensions / primitive type is given by Shape, below.
+//
+// LINT.IfChange
 enum PrimitiveType {
   // Invalid primitive type to serve as default.
   PRIMITIVE_TYPE_INVALID = 0;
@@ -71,7 +73,10 @@ enum PrimitiveType {
   // An opaque type used for passing context-specific data to a custom
   // operation. Shapes of this primitive type will have empty dimensions and
   // tuple_shapes fields.
-  OPAQUE = 14;
+  //
+  // (OPAQUE would be a better name for this identifier, but that conflicts with
+  // a macro defined in windows.h.)
+  OPAQUE_TYPE = 14;
 
   // A token type threaded between side-effecting operations. Shapes of this
   // primitive type will have empty dimensions and tuple_shapes fields.
@@ -79,6 +84,10 @@ enum PrimitiveType {
 
   // Next = 19
 }
+// LINT.ThenChange(
+//   https://www.tensorflow.org/code/tensorflow/compiler/xla/shape_util.cc,
+//   https://www.tensorflow.org/code/tensorflow/compiler/xla/tools/driver.cc
+// )
 
 // Describes the padding configuration for Pad operation. The padding amount on
 // both edges as well as between the elements are specified for each dimension.
@@ -107,13 +116,12 @@ enum Format {
   INVALID_FORMAT = 0;
   // The default layout, with exactly one storage location per element.
   DENSE = 1;
-  // A sparsely encoded layout, providing only the index/value pairs of non-zero
-  // elements.
-  SPARSE = 2;
+  reserved 2;
+  reserved "SPARSE";
 }
 
 // Describes a tile used in tiling-based layout. Refer to
-// g3doc/third_party/tensorflow/compiler/xla/g3doc/layout_with_tiling.md for
+// g3doc/third_party/tensorflow/compiler/xla/g3doc/tiled_layout.md for
 // details about tiling-based layout.
 message TileProto {
   // Number of elements in each dimension of the tile. It's ordered from the
@@ -148,10 +156,8 @@ message LayoutProto {
   reserved 3;
   reserved "padding_value";
 
-  // The maximum number of elements that can be stored for SPARSE formats.  This
-  // can be used to determine the maximum size in bytes of arrays stored in
-  // memory.  This field must be unset unless the format is SPARSE.
-  int64 max_sparse_elements = 5;
+  reserved 5;
+  reserved "max_sparse_elements";
 
   // A sequence of tiles, starting from the tile that's applied first to the
   // Shape.
@@ -166,6 +172,10 @@ message LayoutProto {
   //
   // TODO(b/119839262): implement in each backend or add Unimplemented error.
   int64 element_size_in_bits = 7;
+
+  // Memory space where this array resides. The integer field is interpreted in
+  // a backend-specific manner.
+  int64 memory_space = 8;
 
   // Important: if any field is added, be sure to modify ShapeUtil::Equal() and
   // LayoutUtil::Hash appropriately to account for the new field.
@@ -236,6 +246,14 @@ message ComputationStats {
   double transcendental_count = 2;
 }
 
+// The type optimization profiles in use.
+enum ProfileType {
+  INVALID = 0;
+  WINDOW = 1;
+  FLAG = 2;
+  INTEGER = 3;
+}
+
 // Symbolization metadata for HLO Instructions.
 //
 // This metadata is used for debugging XLA code generation, as well as
@@ -253,12 +271,23 @@ message OpMetadata {
   //
   // This name is often unique within a computation. Note: some frameworks
   // add auto-generated names if the user does not provide one.
+  //
+  // A dummy name may be assigned if op_name is empty in order to keep track of
+  // where op_name first became empty. Dummy names begin with "DUMMY_" and may
+  // include the current HloPassMetadata.pass_id.
   string op_name = 2;
   // Indicate a file and line that this op is associated to in a user's program.
   //
   // e.g. it could be the file and line of user code that generated the op.
   string source_file = 3;
   int32 source_line = 4;
+
+  repeated ProfileType profile_type = 5;
+
+  // HloPassMetadata.pass_id of the pass that created this HLO instruction
+  // object. Should never be copied between HLO instructions. Zero if unset and
+  // -1 if the instruction was created before HLO passes began.
+  int64 creation_pass_id = 6;
 }
 
 // Profile data from the execution of a computation.
@@ -287,6 +316,10 @@ message ExecutionProfile {
 
   // The size of the binary code in the executable.
   int64 executable_size_in_bytes = 6;
+
+  // Whether this profile was drawn from a cache of profiles instead of from
+  // execution on the hardware.
+  bool profile_cache_hit = 7;
 }
 
 // Handle given to a user that represents an execution that the user launched
@@ -513,6 +546,12 @@ message ConvolutionDimensionNumbers {
   // Next = 13
 }
 
+enum PaddingType {
+  PADDING_INVALID = 0;
+  PADDING_VALID = 1;  // Only valid portion of the base are covered.
+  PADDING_SAME = 2;  // Extra is added to produce same output size as the input.
+}
+
 enum FftType {
   FFT = 0;    // Forward FFT; complex in, complex out.
   IFFT = 1;   // Inverse FFT; complex in, complex out.
@@ -546,6 +585,13 @@ enum RandomDistribution {
   // Next: 4
 }
 
+enum RandomAlgorithm {
+  RNG_DEFAULT = 0;  // Backend dependent default algorithm.
+  RNG_THREE_FRY = 1;
+  RNG_PHILOX = 2;
+  // Next: 2
+}
+
 message TriangularSolveOptions {
   // If true, solves ax = b. If false, solves xa = b.
   bool left_side = 1;
@@ -562,7 +608,7 @@ message TriangularSolveOptions {
     NO_TRANSPOSE = 1;  // Don't transpose 'a'.
     TRANSPOSE = 2;     // Transpose 'a'.
     ADJOINT = 3;       // Complex conjugate and transpose 'a'.
-  };
+  }
   Transpose transpose_a = 4;
 }
 
@@ -570,6 +616,12 @@ message CholeskyOptions {
   // If true, uses the lower triangle of `a`. If false, uses the upper triangle
   // of `a`.
   bool lower = 1;
+}
+
+// Generic map of attributes used to pass hints / configuration options from
+// the Python frontend to the XLA backend.
+message FrontendAttributes {
+  map<string, string> map = 1;
 }
 
 message OpSharding {
@@ -583,6 +635,9 @@ message OpSharding {
     TUPLE = 2;
     // None of the above; tile_shape and tile_assignment are both used.
     OTHER = 3;
+    // This op is manually sharded: the shapes are already partitioned and the
+    // partitioner should not change this op.
+    MANUAL = 4;
   }
   Type type = 1;
   // The shape of the sharded tile.
@@ -601,13 +656,24 @@ message OpSharding {
   // applied, this is inferred from the instruction this sharding gets attached
   // to.
   repeated OpSharding tuple_shardings = 5;
+
+  // Only used for OTHER type. If true, data is sharded according to other
+  // dimensions of tile_assignment(), but replicated across devices along the
+  // last dimension. (Experimental)
+  bool replicate_on_last_tile_dim = 6;
+  // This field is used to track the source of this sharding, usually derived
+  // from instructions. Multple metadata may be populated if sharding is
+  // combined with other shardings.  Metadata are to not be populated when
+  // type == TUPLE and instead metadata should be set on individual tuple
+  // elements.
+  repeated OpMetadata metadata = 7;
 }
 
 // Describes the replica groups in a cross replica op (e.g., all-reduce and
 // all-to-all).
 message ReplicaGroup {
   // The ids of the replicas that belongs to the same group. The ordering of the
-  // ids matters in some op (e.g., all-to-all).
+  // ids matters in some ops (e.g., all-to-all).
   repeated int64 replica_ids = 1;
 }
 
@@ -659,4 +725,12 @@ message WhileLoopBackendConfig {
   // This indirection lets us distinguish between known-trip-count == 0 and
   // unknown-trip-count.
   KnownTripCount known_trip_count = 1;
+}
+
+// Specifies a pair of output/operand buffers for kCustomCall that alias each
+// other.
+message CustomCallOutputOperandAliasing {
+  repeated int64 output_shape_index = 1;
+  int64 operand_index = 2;
+  repeated int64 operand_shape_index = 3;
 }

@@ -16,6 +16,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/hlo_graph_dumper.h"
 
 #include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <deque>
@@ -38,6 +39,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_instructions.h"
 #include "tensorflow/compiler/xla/service/hlo_module.h"
+#include "tensorflow/compiler/xla/service/hlo_opcode.h"
 #include "tensorflow/compiler/xla/service/pattern_matcher.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/types.h"
@@ -61,9 +63,6 @@ using absl::StrAppend;
 using absl::StrCat;
 using absl::StrFormat;
 using absl::StrJoin;
-using tensorflow::Env;
-using tensorflow::WriteStringToFile;
-using tensorflow::io::JoinPath;
 
 // Used to indicate how we should treat a given HLOInstruction in the graph.
 // should we treat it like normal, hide it, and so on?
@@ -120,7 +119,7 @@ class NodeFilter {
 // We arbitrarily set this as the boundary between "large" and "small"
 // instructions.
 bool IsSmall(const HloInstruction* instr) {
-  if (ShapeUtil::HasPrimitiveType(instr->shape(), OPAQUE) ||
+  if (ShapeUtil::HasPrimitiveType(instr->shape(), OPAQUE_TYPE) ||
       ShapeUtil::HasPrimitiveType(instr->shape(), TOKEN)) {
     return true;
   }
@@ -211,6 +210,12 @@ string NodeColorAttributes(ColorScheme color) {
 // graphviz HTML-like string.
 string HtmlLikeStringSanitize(absl::string_view s) {
   return absl::StrReplaceAll(s, {{"<", "&lt;"}, {">", "&gt;"}});
+}
+
+bool IsFusedBroadcastOfConstantEffectiveScalar(const HloInstruction* instr) {
+  namespace m = match;
+  return instr->parent()->IsFusionComputation() &&
+         Match(instr, m::Broadcast(m::ConstantEffectiveScalar()));
 }
 
 // Tries to generates a human-readable one-word description of the given
@@ -307,12 +312,13 @@ optional<string> MatchTrivialComputation(const HloComputation* computation) {
 class HloDotDumper {
  public:
   HloDotDumper(const HloComputation* computation, absl::string_view label,
-               const DebugOptions& debug_options, bool show_backend_config,
+               const DebugOptions& debug_options,
+               HloRenderOptions hlo_render_options,
                const HloExecutionProfile* profile, NodeFilter filter)
       : computation_(computation),
         label_(label),
         debug_options_(debug_options),
-        show_backend_config_(show_backend_config),
+        hlo_render_options_(hlo_render_options),
         profile_(profile),
         filter_(std::move(filter)) {}
 
@@ -379,11 +385,11 @@ class HloDotDumper {
   const HloComputation* computation_;  // never null
   const string label_;                 // overall name for the graph
   const DebugOptions& debug_options_;
-  const bool show_backend_config_;
+  const HloRenderOptions hlo_render_options_;
   const HloExecutionProfile* profile_;  // may be null
   const NodeFilter filter_;
 
-  // Each HloInstruction dumped gets a monotically-increasing node ID.  This
+  // Each HloInstruction dumped gets a monotonically-increasing node ID.  This
   // must start at 1, because that's where graphviz's accounting starts.
   int64 next_node_id_ = 1;
   absl::flat_hash_map<const HloInstruction*, int64> node_ids_;
@@ -560,7 +566,8 @@ bool HloDotDumper::ShouldShowFusionSubcomputation(const HloInstruction* instr) {
 bool HloDotDumper::ShouldShowSubcomputation(const HloComputation* subcomp) {
   if (subcomp->IsFusionComputation()) {
     const HloInstruction* fusion = subcomp->FusionInstruction();
-    if (!filter_.Show(fusion) || filter_.SomeOrAllOperandsOmitted(fusion)) {
+    if (!filter_.Show(fusion) || filter_.SomeOrAllOperandsOmitted(fusion) ||
+        !hlo_render_options_.show_fusion_subcomputations) {
       return false;
     }
   }
@@ -681,9 +688,11 @@ string HloDotDumper::DumpComputation(const HloComputation* comp) {
 string HloDotDumper::DumpRootTag() {
   const HloInstruction* from = GetNodeForEdge(computation_->root_instruction());
 
-  // We didn't display constants as separate nodes; so if the root is a
-  // constant, we don't add root tag or edge for it.
-  if (!filter_.Show(from) || from->opcode() == HloOpcode::kConstant) {
+  // We didn't display constants or broadcasts of effective scalars within
+  // fusions as separate nodes; so if the root is a constant/broadcast of
+  // scalar, we don't add root tag or edge for it.
+  if (!filter_.Show(from) || from->opcode() == HloOpcode::kConstant ||
+      IsFusedBroadcastOfConstantEffectiveScalar(from)) {
     return "";
   }
 
@@ -757,9 +766,10 @@ bool HloDotDumper::ShouldMergeIntoUsers(const HloInstruction* instr) const {
 }
 
 string HloDotDumper::DumpInstruction(const HloInstruction* instr) {
-  // We don't display constants as separate nodes; they're merged into their
-  // users.
-  if (instr->opcode() == HloOpcode::kConstant) {
+  // We don't display constants or broadcasts of effective scalar constants
+  // within fusions as separate nodes; they're merged into their users.
+  if (instr->opcode() == HloOpcode::kConstant ||
+      IsFusedBroadcastOfConstantEffectiveScalar(instr)) {
     return "";
   }
   // Skip this node if it's merged into its users.
@@ -813,9 +823,11 @@ string HloDotDumper::DumpInstruction(const HloInstruction* instr) {
 
 string HloDotDumper::GetInstructionNodeInlinedOperands(
     const HloInstruction* instr) {
-  auto stringify_constant = [](const HloConstantInstruction* constant) {
-    const auto& shape = constant->shape();
-
+  // The constant's shape is a parameter because, in the case of a broadcasted
+  // scalar constant, we want to show the broadcasted shape, not the constant's
+  // scalar shape.
+  auto stringify_constant = [](const HloConstantInstruction* constant,
+                               const Shape& shape) {
     // If the shape has a dimension of size zero, print it as e.g.
     // "{} (f32[42, 0, 10])".  The alternative, calling Literal::ToString(),
     // enumerates all of its empty dimensions (e.g.  "{ { {}, {} }, ..."), which
@@ -824,19 +836,19 @@ string HloDotDumper::GetInstructionNodeInlinedOperands(
       return StrFormat("{} (%s)", ShapeUtil::HumanString(constant->shape()));
     }
 
-    // Print the literal value of constants with <= K elements.
+    // Print the literal value of constants with <= K elements.  Note that we
+    // use `constant->shape()` rather than `shape`, because if `constant` is a
+    // scalar that's broadcasted into `shape`, we want to print the constant.
     optional<int64> elem_count;
     if (shape.IsArray()) {
-      elem_count = 1;
-      for (int64 dim : shape.dimensions()) {
-        *elem_count *= dim;
-      }
+      elem_count = ShapeUtil::ElementsIn(constant->shape());
     }
     // Allow HloDotDumper to print HloInstruction reconstructed from HloProto
     // collected from profiling tools. Those constants may not have a valid
     // literal.
     if (elem_count.has_value() && *elem_count <= 8 && constant->HasLiteral()) {
-      return constant->literal().ToString();
+      return StrFormat("%s %s", shape.ToString(),
+                       constant->literal().ToStringWithoutShape());
     }
 
     // Otherwise, print e.g. "%constant.42 (s32[100])".
@@ -846,17 +858,20 @@ string HloDotDumper::GetInstructionNodeInlinedOperands(
     } else {
       constant_name = StrCat("constant ", constant->name());
     }
-    return StrFormat("%s %s", constant_name,
-                     ShapeUtil::HumanString(constant->shape()));
+    return StrFormat("%s %s", constant_name, ShapeUtil::HumanString(shape));
   };
 
   std::vector<string> lines;
   for (int64 i = 0; i < instr->operand_count(); ++i) {
     const HloInstruction* operand = instr->operand(i);
-    const auto* constant_operand = DynCast<HloConstantInstruction>(operand);
     optional<string> operand_str;
-    if (constant_operand != nullptr) {
-      operand_str = stringify_constant(constant_operand);
+    if (const auto* constant_operand =
+            DynCast<HloConstantInstruction>(operand)) {
+      operand_str =
+          stringify_constant(constant_operand, constant_operand->shape());
+    } else if (IsFusedBroadcastOfConstantEffectiveScalar(operand)) {
+      operand_str = stringify_constant(
+          Cast<HloConstantInstruction>(operand->operand(0)), operand->shape());
     } else if (ShouldMergeIntoUsers(operand)) {
       // Special case: If the operand is a parameter to a fusion node and it
       // always has a constant value, display it like a regular constant.
@@ -866,7 +881,7 @@ string HloDotDumper::GetInstructionNodeInlinedOperands(
       if (operand->opcode() == HloOpcode::kParameter) {
         if (const HloConstantInstruction* constant =
                 TryGetFusionParameterConstant(operand)) {
-          operand_str = stringify_constant(constant);
+          operand_str = stringify_constant(constant, constant->shape());
         } else {
           operand_str = StrFormat("Parameter %d", operand->parameter_number());
         }
@@ -954,17 +969,21 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     case HloOpcode::kReal:
     case HloOpcode::kRemainder:
     case HloOpcode::kRng:
+    case HloOpcode::kRngGetAndUpdateState:
+    case HloOpcode::kRngBitGenerator:
     case HloOpcode::kRoundNearestAfz:
     case HloOpcode::kRsqrt:
     case HloOpcode::kSelect:
     case HloOpcode::kShiftLeft:
     case HloOpcode::kShiftRightArithmetic:
     case HloOpcode::kShiftRightLogical:
+    case HloOpcode::kLogistic:
     case HloOpcode::kSign:
     case HloOpcode::kSin:
     case HloOpcode::kSlice:
     case HloOpcode::kSort:
     case HloOpcode::kSqrt:
+    case HloOpcode::kCbrt:
     case HloOpcode::kSubtract:
     case HloOpcode::kTanh:
       // De-emphasize scalar-shaped elementwise ops -- they're generally
@@ -993,6 +1012,7 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     case HloOpcode::kGather:
     case HloOpcode::kPad:
     case HloOpcode::kReshape:
+    case HloOpcode::kDynamicReshape:
     case HloOpcode::kReverse:
     case HloOpcode::kTupleSelect:
     case HloOpcode::kTranspose:
@@ -1013,6 +1033,8 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     case HloOpcode::kScatter:
       // Do not de-emphasize Scatter, since it involves significant work.
     case HloOpcode::kCopy:
+    case HloOpcode::kCopyStart:
+    case HloOpcode::kCopyDone:
       // Emphasize copy nodes, which are either physical transposes (and thus
       // significant), or copies of read-only buffers (and thus dead weight).
       return kGreen;
@@ -1037,12 +1059,17 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     case HloOpcode::kFusion:
     case HloOpcode::kMap:
     case HloOpcode::kGetDimensionSize:
+    case HloOpcode::kSetDimensionSize:
       return kGray;
+    case HloOpcode::kAllGather:
     case HloOpcode::kAllReduce:
     case HloOpcode::kAllToAll:
     case HloOpcode::kCollectivePermute:
+    case HloOpcode::kCollectivePermuteStart:
+    case HloOpcode::kCollectivePermuteDone:
     case HloOpcode::kInfeed:
     case HloOpcode::kOutfeed:
+    case HloOpcode::kPartitionId:
     case HloOpcode::kRecv:
     case HloOpcode::kRecvDone:
     case HloOpcode::kSend:
@@ -1110,7 +1137,8 @@ string HloDotDumper::GetInstructionNodeMetadata(const HloInstruction* instr) {
 
 string HloDotDumper::GetInstructionNodeBackendConfig(
     const HloInstruction* instr) {
-  if (!show_backend_config_ || instr->raw_backend_config_string().empty()) {
+  if (!hlo_render_options_.show_backend_config ||
+      instr->raw_backend_config_string().empty()) {
     return "";
   }
 
@@ -1125,7 +1153,16 @@ string HloDotDumper::GetInstructionNodeExtraInfo(const HloInstruction* instr) {
   for (const auto& line : instr->ExtraAttributesToString(
            HloPrintOptions().set_print_subcomputation_mode(
                HloPrintOptions::PrintSubcomputationMode::kOff))) {
-    lines.push_back(HtmlLikeStringSanitize(line));
+    // Some instructions have giant replica group fields, so truncate the
+    // replica group line length to 128.
+    constexpr int kMaxReplicaGroupLen = 128;
+    if (absl::StartsWith(line, "replica_groups=") &&
+        line.length() > kMaxReplicaGroupLen) {
+      lines.push_back(HtmlLikeStringSanitize(
+          StrCat(line.substr(0, kMaxReplicaGroupLen - 3), "...")));
+    } else {
+      lines.push_back(HtmlLikeStringSanitize(line));
+    }
   }
 
   // Show the shape and layout of the instruction, unless it's an inlined fusion
@@ -1154,7 +1191,7 @@ string HloDotDumper::GetInstructionNodeExtraInfo(const HloInstruction* instr) {
       instr_shape = StrCat(
           absl::string_view(instr_shape).substr(0, kMaxShapeLen - 3), "...");
     }
-    lines.push_back(instr_shape);
+    lines.push_back(HtmlLikeStringSanitize(instr_shape));
   }
   if (debug_options_.xla_hlo_graph_addresses()) {
     lines.push_back(StrFormat("[%p]", instr));
@@ -1178,6 +1215,7 @@ void HloDotDumper::AddInstructionIncomingEdges(const HloInstruction* instr) {
     from = GetNodeForEdge(from);
 
     if (!filter_.Show(from) || from->opcode() == HloOpcode::kConstant ||
+        IsFusedBroadcastOfConstantEffectiveScalar(from) ||
         ShouldMergeIntoUsers(from)) {
       return;
     }
@@ -1537,17 +1575,119 @@ string WrapDotInHtml(absl::string_view dot) {
 
 tensorflow::mutex url_renderer_mu(tensorflow::LINKER_INITIALIZED);
 std::function<StatusOr<string>(absl::string_view)>* url_renderer
-    GUARDED_BY(url_renderer_mu) = nullptr;
+    TF_GUARDED_BY(url_renderer_mu) = nullptr;
 
-// Precondition: url_renderer != nullptr.
+// Storage for fusion visualization: (module_id, computation_id) -> sequence of
+// dot dumps.
+tensorflow::mutex fusion_visualizer_state_mu(tensorflow::LINKER_INITIALIZED);
+static auto& fusion_visualizer_state TF_GUARDED_BY(fusion_visualizer_state_mu) =
+    *new absl::flat_hash_map<std::pair<int64, int64>,
+                             std::vector<std::string>>();
+
+// Generates a key to the fusion visualizer state mapping.
+std::pair<int, int> FusionVisualizerStateKey(
+    const HloComputation& computation) {
+  return std::make_pair(computation.parent()->unique_id(),
+                        computation.unique_id());
+}
+
+// Generates a fusion explorer for the given computation using the data in
+// fusion_visualizer_state and the URL renderer. Precondition: url_renderer !=
+// nullptr.
+StatusOr<std::string> WrapFusionExplorer(const HloComputation& computation)
+    TF_EXCLUSIVE_LOCKS_REQUIRED(url_renderer_mu) {
+  CHECK(url_renderer != nullptr);
+  tensorflow::mutex_lock lock(fusion_visualizer_state_mu);
+  const std::vector<std::string>& dot_graphs =
+      fusion_visualizer_state[FusionVisualizerStateKey(computation)];
+  std::vector<std::string> dot_urls;
+  dot_urls.reserve(dot_graphs.size());
+  for (const std::string& dot : dot_graphs) {
+    TF_ASSIGN_OR_RETURN(std::string url, (*url_renderer)(dot));
+    dot_urls.push_back(url);
+  }
+
+  return absl::StrReplaceAll(
+      R"(
+  <!doctype html>
+  <style>
+    html, body {height: 100%; text-align: center;}
+    #display {height: 80%; width: 80%;}
+  </style>
+  <title>Fusion Explorer: $TITLE</title>
+  <iframe id='display' width=80% height=80%></iframe>
+  <p id='description'></p>
+  <p>
+    <a id='prev' href='#'>Prev Step</a>
+    <a id='next' href='#'>Next Step</a>
+  </p>
+  <p>
+    Use j/k for keyboard navigation.
+  </p>
+  <script>
+  var currId = -1;
+  var urls = [$URLS];
+
+  var setIframe = function() {
+    document.getElementById('display').src = urls[currId];
+  };
+
+  var update = function(delta)  {
+    currId = (currId + delta + urls.length) % urls.length;
+    document.getElementById('description').innerHTML = "Frame #"
+      + (currId + 1) + " / " + urls.length;
+    setIframe();
+  };
+
+  document.getElementById('prev').onclick = function() {
+    update(-1);
+    return false;
+  };
+
+  document.getElementById('next').onclick = function() {
+    update(1);
+    return false;
+  };
+
+  window.addEventListener("keydown", function (event) {
+    if (event.defaultPrevented) {
+      return;
+    }
+    if (event.key == "j") {
+      update(1);
+    } else if (event.key == "k") {
+      update(-1);
+    } else {
+      return;
+    }
+    event.preventDefault();
+  }, true);
+
+  document.addEventListener("DOMContentLoaded", function() {
+    update(1);
+  });
+
+  </script>
+  )",
+      {{"$URLS", absl::StrJoin(dot_urls, ", ",
+                               [&](std::string* out, const std::string& url) {
+                                 absl::StrAppend(out, "\"", url, "\"");
+                               })},
+       {"$TITLE",
+        absl::StrCat(computation.parent()->name(), "_", computation.name())}});
+}
+
+// Precondition: (url_renderer != nullptr || (format != kUrl
+//   && format != kFusionVisualization)).
 //
 // (We specify this as a precondition rather than checking it in here and
 // returning an error because we want to fail quickly when there's no URL
 // renderer available, and this function runs only after we've done all the work
 // of producing dot for the graph.)
-StatusOr<string> WrapDotInFormat(absl::string_view dot,
+StatusOr<string> WrapDotInFormat(const HloComputation& computation,
+                                 absl::string_view dot,
                                  RenderedGraphFormat format)
-    EXCLUSIVE_LOCKS_REQUIRED(url_renderer_mu) {
+    TF_EXCLUSIVE_LOCKS_REQUIRED(url_renderer_mu) {
   switch (format) {
     case RenderedGraphFormat::kUrl:
       CHECK(url_renderer != nullptr)
@@ -1557,6 +1697,8 @@ StatusOr<string> WrapDotInFormat(absl::string_view dot,
       return WrapDotInHtml(dot);
     case RenderedGraphFormat::kDot:
       return string(dot);
+    case RenderedGraphFormat::kFusionVisualization:
+      return WrapFusionExplorer(computation);
   }
 }
 
@@ -1575,27 +1717,46 @@ void RegisterGraphToURLRenderer(
       std::move(renderer));
 }
 
+Status RegisterFusionState(const HloComputation& computation,
+                           absl::string_view label) {
+  tensorflow::mutex_lock lock(fusion_visualizer_state_mu);
+  TF_ASSIGN_OR_RETURN(
+      string dot_graph,
+      RenderGraph(computation,
+                  absl::StrCat(computation.parent()->name(), ", ",
+                               computation.name(), ", ", label),
+                  /*debug_options=*/{}, xla::RenderedGraphFormat::kDot,
+                  /*hlo_execution_profile=*/nullptr,
+                  /*hlo_render_options=*/{}));
+  std::vector<std::string>& fusion_states =
+      fusion_visualizer_state[FusionVisualizerStateKey(computation)];
+  if (fusion_states.empty() || fusion_states.back() != dot_graph) {
+    fusion_states.push_back(dot_graph);
+  }
+  return Status::OK();
+}
+
 StatusOr<string> RenderGraph(const HloComputation& computation,
                              absl::string_view label,
                              const DebugOptions& debug_options,
                              RenderedGraphFormat format,
                              const HloExecutionProfile* hlo_execution_profile,
-                             bool show_backend_config) {
+                             HloRenderOptions hlo_render_options) {
   tensorflow::mutex_lock lock(url_renderer_mu);
   if (format == RenderedGraphFormat::kUrl && url_renderer == nullptr) {
     return Unavailable("Can't render as URL; no URL renderer was registered.");
   }
 
   string rendered_dot =
-      HloDotDumper(&computation, label, debug_options, show_backend_config,
+      HloDotDumper(&computation, label, debug_options, hlo_render_options,
                    hlo_execution_profile, NodeFilter())
           .Dump();
-  return WrapDotInFormat(rendered_dot, format);
+  return WrapDotInFormat(computation, rendered_dot, format);
 }
 
 StatusOr<string> RenderNeighborhoodAround(
     const HloInstruction& node, int radius, RenderedGraphFormat format,
-    bool show_backend_config,
+    HloRenderOptions hlo_render_options,
     const absl::flat_hash_set<const HloInstruction*>& boundary) {
   tensorflow::mutex_lock lock(url_renderer_mu);
   if (format == RenderedGraphFormat::kUrl && url_renderer == nullptr) {
@@ -1608,16 +1769,16 @@ StatusOr<string> RenderNeighborhoodAround(
   string rendered_dot =
       HloDotDumper(node.parent(), label,
                    node.GetModule()->config().debug_options(),
-                   show_backend_config, /*profile=*/nullptr,
+                   hlo_render_options, /*profile=*/nullptr,
                    MakeNodeRadiusAroundFilter(&node, radius, boundary))
           .Dump();
-  return WrapDotInFormat(rendered_dot, format);
+  return WrapDotInFormat(*node.parent(), rendered_dot, format);
 }
 
 StatusOr<string> RenderAllPathsFromTo(const HloInstruction& from,
                                       const HloInstruction& to, int64 max_nodes,
                                       RenderedGraphFormat format,
-                                      bool show_backend_config) {
+                                      HloRenderOptions hlo_render_options) {
   tensorflow::mutex_lock lock(url_renderer_mu);
   if (format == RenderedGraphFormat::kUrl && url_renderer == nullptr) {
     return FailedPrecondition(
@@ -1639,10 +1800,10 @@ StatusOr<string> RenderAllPathsFromTo(const HloInstruction& from,
                    "NODES***<br/><br/>");
   }
   string rendered_dot =
-      HloDotDumper(from.parent(), label, debug_options, show_backend_config,
+      HloDotDumper(from.parent(), label, debug_options, hlo_render_options,
                    /*profile=*/nullptr, filter)
           .Dump();
-  return WrapDotInFormat(rendered_dot, format);
+  return WrapDotInFormat(*from.parent(), rendered_dot, format);
 }
 
 }  // namespace xla

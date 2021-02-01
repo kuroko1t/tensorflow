@@ -12,301 +12,570 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Facilities for creating multiple test combinations.
+"""This module customizes `test_combinations` for `tf.distribute.Strategy`.
 
-Here is an example of testing various optimizers in Eager and Graph mode:
-
-class AdditionExample(test.TestCase, parameterized.TestCase):
-  @combinations.generate(
-     combinations.combine(mode=["graph", "eager"],
-                          optimizer=[AdamOptimizer(),
-                                     GradientDescentOptimizer()]))
-  def testOptimizer(self, optimizer):
-    ... f(optimizer)...
-
-This will run `testOptimizer` 4 times with the specified optimizers: 2 in
-Eager and 2 in Graph mode.
-The test will be provided with arguments that match the arguments of combine
-by name.  It is necessary to request all arguments, except for `mode`, which is
-optional.
-
-`combine()` function is available for creating a cross product of various
-options.  `times()` function exists for creating a product of N `combine()`-ed
-results.  See below.
+Additionally it provides `generate()`, `combine()` and `times()` with
+`tf.distribute.Strategy` customizations as a default.
 """
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from collections import OrderedDict
+import collections
+import copy
+import re
 import sys
 import types
 import unittest
 
-from absl.testing import parameterized
 import six
 
+from tensorflow.python.client import session
+from tensorflow.python.distribute import collective_all_reduce_strategy
+from tensorflow.python.distribute import distribute_lib
+from tensorflow.python.distribute import multi_process_runner
+from tensorflow.python.distribute import multi_worker_test_base
 from tensorflow.python.eager import context
+from tensorflow.python.eager import def_function
+from tensorflow.python.framework import combinations as framework_combinations
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import test_combinations as combinations_lib
+from tensorflow.python.framework import test_util
+from tensorflow.python.platform import flags
+from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.util import tf_decorator
 from tensorflow.python.util import tf_inspect
-
-
-GPU_TEST = "test_gpu" in sys.argv[0]
-TPU_TEST = "test_tpu" in sys.argv[0]
+from tensorflow.python.util.tf_export import tf_export
 
 
 # TODO(rchao): Rename `distribution` parameter to `strategy` or
-# `distribute_strategy`
-def generate(combinations):
-  """A decorator for generating test cases of a test method or a test class.
+# `distribute_strategy` in all tests.
+class DistributionParameter(combinations_lib.ParameterModifier):
+  """Transforms arguments of type `NamedDistribution`.
 
-  Args:
-    combinations: a list of dictionaries created using combine() and times().
-
-  Restrictions:
-   -- the "mode" argument can be either "eager" or "graph".  It's "graph" by
-      default.
-   -- arguments of the test method must match by name to get the corresponding
-      value of the combination.  Tests must accept all arguments except the
-      "mode", "required_tpu" and "required_gpus".
-   -- "distribution" argument is special and optional.  It is meant for passing
-      instances of DistributionStrategy.  Each instance is to be passed as via
-      `NamedDistribution`.  If using "distribution", "required_gpus" and
-      "required_tpu" should be specified via the NamedDistribution instance,
-      rather than as separate arguments.
-   -- "required_tpu" argument is special and optional.  If not `None`, then the
-      test will be skipped if TPUs aren't available.
-   -- "required_gpus" argument is special and optional.  If not `None`, then the
-      test will be skipped if the specified number of GPUs aren't available.
-
-  Returns:
-    a decorator that will cause the test method or the test class to be run
-    under the specified conditions.
-
-  Raises:
-    ValueError - if "mode" argument wasn't either "eager" or "graph" or if other
-      arguments were not accepted by the test method.
+  Convert all arguments of type `NamedDistribution` to the value of their
+  `strategy` property.
   """
 
-  def decorator(test_method_or_class):
-    """The decorator to be returned."""
+  def modified_arguments(self, kwargs, requested_parameters):
+    # Get the parameter that indicates if we need to set the `_use_policy` flag
+    # on the strategy object. This is a temporary flag for testing the variable
+    # policy rollout.
+    use_var_policy = kwargs.get("use_var_policy", None)
+    distribution_arguments = {}
+    for k, v in kwargs.items():
+      if isinstance(v, NamedDistribution):
+        strategy = v.strategy
+        if use_var_policy:
+          strategy.extended._use_var_policy = use_var_policy
+        distribution_arguments[k] = strategy
+    return distribution_arguments
 
-    # Generate good test names that can be used with --test_filter.
-    named_combinations = []
-    for combination in combinations:
-      # We use OrderedDicts in `combine()` and `times()` to ensure stable
-      # order of keys in each dictionary.
-      assert isinstance(combination, OrderedDict)
-      name = "".join([
-          "_{}_{}".format(
-              "".join(filter(str.isalnum, key)),
-              "".join(filter(str.isalnum, str(value))))
-          for key, value in combination.items()
-      ])
-      named_combinations.append(
-          OrderedDict(
-              list(combination.items()) + [("testcase_name",
-                                            "_test{}".format(name))]))
 
-    if isinstance(test_method_or_class, type):
-      class_object = test_method_or_class
-      class_object._test_method_ids = test_method_ids = {}
-      for name, test_method in six.iteritems(class_object.__dict__.copy()):
-        if (name.startswith(unittest.TestLoader.testMethodPrefix) and
-            isinstance(test_method, types.FunctionType)):
-          delattr(class_object, name)
-          methods = {}
-          parameterized._update_class_dict_for_param_test_case(
-              class_object.__name__, methods, test_method_ids, name,
-              parameterized._ParameterizedTestIter(
-                  _augment_with_special_arguments(test_method),
-                  named_combinations, parameterized._NAMED, name))
-          for method_name, method in six.iteritems(methods):
-            setattr(class_object, method_name, method)
+class ClusterParameters(combinations_lib.ParameterModifier):
+  """Adds cluster parameters if a `NamedDistribution` has it.
 
-      return class_object
+  It needs to be before DistributionParameter.
+  """
+
+  def modified_arguments(self, kwargs, requested_parameters):
+    strategy = None
+    for _, v in kwargs.items():
+      if isinstance(v, NamedDistribution):
+        if strategy is not None and _num_total_workers(v.has_chief,
+                                                       v.num_workers) > 1:
+          raise ValueError("Only support one NamedDistribution for multi worker"
+                           "tests.")
+        strategy = v
+
+    if strategy:
+      has_chief = strategy.has_chief
+      num_workers = strategy.num_workers
+      runner = strategy.runner
+      if "has_chief" in kwargs and kwargs["has_chief"] != has_chief:
+        raise ValueError(
+            "both has_chief and strategy specified but are not compatible")
+      if "num_workers" in kwargs and kwargs["num_workers"] != num_workers:
+        raise ValueError(
+            "both num_workers and strategy specified but are not compatible")
     else:
-      test_method = _augment_with_special_arguments(test_method_or_class)
-      return parameterized.named_parameters(*named_combinations)(test_method)
+      has_chief = kwargs.get("has_chief", False)
+      num_workers = kwargs.get("num_workers", 1)
+      runner = kwargs.get("runner", None)
 
-  return decorator
+    # Always set cluster parameters if they're requested. So that generate()
+    # works when there's no startegy in the combinations.
+    update = {}
+    if "has_chief" in requested_parameters:
+      update["has_chief"] = has_chief
+    if "num_workers" in requested_parameters:
+      update["num_workers"] = num_workers
+    if "runner" in requested_parameters:
+      update["runner"] = runner
+    return update
 
 
-def _augment_with_special_arguments(test_method):
-  def decorated(self, **kwargs):
-    """A wrapped test method that treats some arguments in a special way."""
-    mode = kwargs.pop("mode", "graph")
+class DistributionCombination(combinations_lib.TestCombination):
+  """Sets up distribution strategy for tests."""
 
-    distribution = kwargs.get("distribution", None)
-    required_tpu = kwargs.pop("required_tpu", False)
-    required_gpus = kwargs.pop("required_gpus", None)
+  def should_execute_combination(self, kwargs):
+    distributions = [
+        v for v in kwargs.values() if isinstance(v, NamedDistribution)
+    ]
+    if test_util.is_xla_enabled() and any(d.no_xla for d in distributions):
+      return (
+          False,
+          "n/a: skipping strategy combination with no_xla=True in XLA tests")
+    return (True, None)
 
-    if distribution:
-      assert required_gpus is None, (
-          "Do not use `required_gpus` and `distribution` together.")
-      assert required_tpu is False, (
-          "Do not use `required_tpu` and `distribution` together.")
-      required_gpus = distribution.required_gpus
-      required_tpu = distribution.required_tpu
+  def parameter_modifiers(self):
+    return [
+        DistributionParameter(),
+        combinations_lib.OptionalParameter("use_var_policy"),
+    ]
 
-    if required_tpu and not TPU_TEST:
-      self.skipTest("Test requires a TPU, but it's not available.")
-    if not required_tpu and TPU_TEST:
-      self.skipTest("Test that doesn't require a TPU.")
 
-    if not required_gpus:
-      if GPU_TEST:
-        self.skipTest("Test that doesn't require GPUs.")
-    elif context.num_gpus() < required_gpus:
-      # TODO(priyag): Consider allowing tests in graph mode using soft
-      # placement.
-      self.skipTest(
-          "{} GPUs are not available for this test. {} GPUs are available".
-          format(required_gpus, context.num_gpus()))
+class ClusterCombination(combinations_lib.TestCombination):
+  """Sets up multi worker tests."""
 
-    # At this point, `kwargs` doesn't have `required_gpus` or `required_tpu`
-    # that the user might have specified.  `kwargs` still has `mode`, which
-    # the test is allowed to accept or ignore.
-    requested_arguments = tf_inspect.getfullargspec(test_method).args
-    missing_arguments = set(list(kwargs.keys()) + ["self"]).difference(
-        set(requested_arguments + ["mode"]))
-    if missing_arguments:
-      raise ValueError("The test is missing arguments {} .".format(
-          missing_arguments))
+  def parameter_modifiers(self):
+    return [ClusterParameters()]
 
-    kwargs_to_pass = {}
-    for arg in requested_arguments:
-      if arg == "self":
-        kwargs_to_pass[arg] = self
-      else:
-        kwargs_to_pass[arg] = kwargs[arg]
 
-    if mode == "eager":
-      with context.eager_mode():
-        if distribution:
-          kwargs_to_pass["distribution"] = distribution.strategy
-        test_method(**kwargs_to_pass)
-    elif mode == "graph":
-      with ops.Graph().as_default(), context.graph_mode():
-        if distribution:
-          kwargs_to_pass["distribution"] = distribution.strategy
-        test_method(**kwargs_to_pass)
+class GPUCombination(combinations_lib.TestCombination):
+  """Enable tests to request GPU hardware and skip non-GPU combinations.
+
+  This class expects test_combinations to be generated with `NamedDistribution`
+  wrapping instances of `tf.distribute.Strategy`.
+
+  Optionally, the `required_gpus` argument is supported.  GPU hardware is
+  required, if its value is `True` or > 0.
+
+  Attributes:
+    GPU_TEST: The environment is considered to have GPU hardware available if
+              the name of the program contains "test_gpu" or "test_xla_gpu".
+  """
+
+  GPU_TEST = re.search(r"(test_gpu|test_xla_gpu)$", sys.argv[0])
+
+  def should_execute_combination(self, kwargs):
+    distributions = [
+        v for v in kwargs.values() if isinstance(v, NamedDistribution)
+    ]
+    required_gpus = kwargs.get("required_gpus", None)
+
+    if distributions and required_gpus:
+      raise ValueError("Do not use `required_gpus` and arguments of type "
+                       "NamedDistribution together.")
+
+    number_of_required_gpus = max([required_gpus or 0] +
+                                  [d.required_gpus or 0 for d in distributions])
+
+    if not number_of_required_gpus and GPUCombination.GPU_TEST:
+      return (False, "Test that doesn't require GPUs.")
+    elif (number_of_required_gpus > 0
+          and context.num_gpus() < number_of_required_gpus):
+      return (False, ("Only {} of {} required GPUs are available.".format(
+          context.num_gpus(), number_of_required_gpus)))
     else:
-      raise ValueError(
-          "'mode' has to be either 'eager' or 'graph' and not {}".format(
-              mode))
-  return decorated
+      return (True, None)
+
+  def parameter_modifiers(self):
+    return [combinations_lib.OptionalParameter("required_gpus")]
 
 
-def combine(**kwargs):
-  """Generate combinations based on its keyword arguments.
+class TPUCombination(combinations_lib.TestCombination):
+  """Allow to request TPU hardware and skip non-TPU combinations.
 
-  Two sets of returned combinations can be concatenated using +.  Their product
-  can be computed using `times()`.
+  This class expects test_combinations to be generated with `NamedDistribution`
+  wrapping instances of `tf.distribute.Strategy`.
 
-  Args:
-    **kwargs: keyword arguments of form `option=[possibilities, ...]`
-         or `option=the_only_possibility`.
+  Optionally, the `required_tpus` parameter is supported.  TPU hardware is
+  required, if its argument is `True` or > 0.
 
-  Returns:
-    a list of dictionaries for each combination. Keys in the dictionaries are
-    the keyword argument names.  Each key has one value - one of the
-    corresponding keyword argument values.
+  Optionally, the `use_cloud_tpu` parameter is supported. If TPU hardware is
+  required by `required_tpus`, it specifically must be a Cloud TPU (specified
+  with `--tpu`) if `use_cloud_tpu` is `True`.
+
+  Attributes:
+    TPU_TEST: The environment is considered to have TPU hardware available if
+              the name of the program contains "test_tpu".
   """
-  if not kwargs:
-    return [OrderedDict()]
 
-  sort_by_key = lambda k: k[0]
-  kwargs = OrderedDict(sorted(kwargs.items(), key=sort_by_key))
-  first = list(kwargs.items())[0]
+  TPU_TEST = "test_tpu" in sys.argv[0]
 
-  rest = dict(list(kwargs.items())[1:])
-  rest_combined = combine(**rest)
+  def should_execute_combination(self, kwargs):
+    distributions = [
+        v for v in kwargs.values() if isinstance(v, NamedDistribution)
+    ]
+    # TODO(isaprykin): Migrate all tests away from using 'required_tpu' in favor
+    # of 'required_tpus'.
+    if "required_tpus" in kwargs and "required_tpu" in kwargs:
+      raise ValueError("Do not use `required_tpu`.  Both `required_tpus` and "
+                       "`required_tpu` were specified.")
+    required_tpus = kwargs.get("required_tpus", None) or kwargs.get(
+        "required_tpu", None)
 
-  key = first[0]
-  values = first[1]
-  if not isinstance(values, list):
-    values = [values]
+    if distributions and required_tpus:
+      raise ValueError("Do not use `required_tpus` and arguments of type "
+                       "NamedDistribution together.")
 
-  return [
-      OrderedDict(sorted(list(combined.items()) + [(key, v)], key=sort_by_key))
-      for v in values
-      for combined in rest_combined
-  ]
+    # TODO(isaprykin): Add support for a particular number of TPUs.  Right now
+    # it's binary.
+    number_of_required_tpus = max([required_tpus or 0] +
+                                  [d.required_tpu or 0 for d in distributions])
+    use_cloud_tpu = any([kwargs.get("use_cloud_tpu")] +
+                        [d.use_cloud_tpu for d in distributions])
+    tpu = hasattr(flags.FLAGS, "tpu") and flags.FLAGS.tpu or ""
 
+    if not number_of_required_tpus and TPUCombination.TPU_TEST:
+      return (False, "Test that doesn't require TPUs.")
+    if number_of_required_tpus and not TPUCombination.TPU_TEST:
+      return (False, "Test requires a TPU, but it's not available.")
+    if use_cloud_tpu and not tpu:
+      return (False, "Test requires a Cloud TPU, but none specified.")
+    if not use_cloud_tpu and tpu:
+      return (False, "Test requires local TPU, but Cloud TPU specified.")
+    return (True, None)
 
-def times(*combined):
-  """Generate a product of N sets of combinations.
-
-  times(combine(a=[1,2]), combine(b=[3,4])) == combine(a=[1,2], b=[3,4])
-
-  Args:
-    *combined: N lists of dictionaries that specify combinations.
-
-  Returns:
-    a list of dictionaries for each combination.
-
-  Raises:
-    ValueError: if some of the inputs have overlapping keys.
-  """
-  assert combined
-
-  if len(combined) == 1:
-    return combined[0]
-
-  first = combined[0]
-  rest_combined = times(*combined[1:])
-
-  combined_results = []
-  for a in first:
-    for b in rest_combined:
-      if set(a.keys()).intersection(set(b.keys())):
-        raise ValueError("Keys need to not overlap: {} vs {}".format(
-            a.keys(), b.keys()))
-
-      combined_results.append(OrderedDict(list(a.items()) + list(b.items())))
-  return combined_results
-
-
-class NamedObject(object):
-  """A class that translates an object into a good test name."""
-
-  def __init__(self, name, obj):
-    self._name = name
-    self._obj = obj
-
-  def __getattr__(self, name):
-    return getattr(self._obj, name)
-
-  def __call__(self, *args, **kwargs):
-    return self._obj(*args, **kwargs)
-
-  def __repr__(self):
-    return self._name
+  def parameter_modifiers(self):
+    return [
+        combinations_lib.OptionalParameter("required_tpus"),
+        combinations_lib.OptionalParameter("required_tpu"),
+        combinations_lib.OptionalParameter("use_cloud_tpu"),
+    ]
 
 
 class NamedDistribution(object):
-  """Translates DistributionStrategy and its data into a good name."""
+  """Wraps a `tf.distribute.Strategy` and adds a name for test titles."""
 
-  def __init__(self, name, distribution_fn, required_gpus=None,
-               required_tpu=False):
-    self._distribution_fn = distribution_fn
+  def __init__(self,
+               name,
+               distribution_fn,
+               required_gpus=None,
+               required_tpu=False,
+               use_cloud_tpu=False,
+               has_chief=False,
+               num_workers=1,
+               pool_runner_fn=None,
+               no_xla=False):
+    """Initialize NamedDistribution.
+
+    Args:
+      name: Name that will be a part of the name of the test case.
+      distribution_fn: A callable that creates a `tf.distribute.Strategy`.
+      required_gpus: The number of GPUs that the strategy requires.
+      required_tpu: Whether the strategy requires TPU.
+      use_cloud_tpu: Whether the strategy requires cloud TPU.
+      has_chief: Whether the strategy requires a chief worker.
+      num_workers: The number of workers that the strategy requires.
+      pool_runner_fn: An optional callable that returns a MultiProcessPoolRunner
+        to run the test.
+      no_xla: Whether to skip in XLA tests.
+    """
+    object.__init__(self)
     self._name = name
-    self._required_gpus = required_gpus
-    self._required_tpu = required_tpu
+    self._distribution_fn = distribution_fn
+    self.required_gpus = required_gpus
+    self.required_tpu = required_tpu
+    self.use_cloud_tpu = use_cloud_tpu
+    self.has_chief = has_chief
+    self.num_workers = num_workers
+    self._pool_runner_fn = pool_runner_fn
+    self.no_xla = no_xla
 
-  def __repr__(self):
-    return self._name
+  @property
+  def runner(self):
+    if self._pool_runner_fn is not None:
+      return self._pool_runner_fn()
+    return None
 
   @property
   def strategy(self):
     return self._distribution_fn()
 
-  @property
-  def required_gpus(self):
-    return self._required_gpus
+  def __repr__(self):
+    return self._name
 
-  @property
-  def required_tpu(self):
-    return self._required_tpu
+
+# This is to allow adding combinations that runs a function both as a
+# tf.function and eagerly.
+#
+# @combinations.generate(
+#   combinations.combine(
+#     tf_function = [combinations.tf_function, combinations.no_tf_function]
+#   )
+# )
+# def testXXX(tf_function):
+#   @tf_function
+#   def foo():
+#     tf.add(1., 1.)
+#
+#   foo()
+tf_function = combinations_lib.NamedObject("TfFunction", def_function.function)
+no_tf_function = combinations_lib.NamedObject("NoTfFunction", lambda f: f)
+
+
+def concat(*combined):
+  """Concats combinations."""
+  result = []
+  for one in combined:
+    result += one
+  return result
+
+
+@tf_export("__internal__.distribute.combinations.generate", v1=[])
+def generate(combinations, test_combinations=()):
+  # pylint: disable=g-doc-args,g-doc-return-or-yield
+  """Distributed adapter of `tf.__internal__.test.combinations.generate`.
+
+  All tests with distributed strategy should use this one instead of
+  `tf.__internal__.test.combinations.generate`. This function has support of
+  strategy combinations, GPU/TPU and multi worker support.
+
+  See `tf.__internal__.test.combinations.generate` for usage.
+  """
+  # pylint: enable=g-doc-args,g-doc-return-or-yield
+  default_combinations = (
+      framework_combinations.EagerGraphCombination(),
+      framework_combinations.TFVersionCombination(),
+      ClusterCombination(),
+      DistributionCombination(),
+      GPUCombination(),
+      TPUCombination(),
+  )
+  # We apply our own decoration to handle multi worker tests before applying
+  # framework.test_combinations.generate. The order is important since we need
+  # framework.test_combinations.generate to apply all parameter modifiers first.
+  combination_decorator = combinations_lib.generate(
+      combinations, test_combinations=default_combinations + test_combinations)
+
+  def decorator(test_method_or_class):
+    if isinstance(test_method_or_class, type):
+      # If it's a test class.
+      class_object = test_method_or_class
+      # Decorate each test method with _multi_worker_test.
+      for name, test_method in six.iteritems(class_object.__dict__.copy()):
+        if (name.startswith(unittest.TestLoader.testMethodPrefix) and
+            isinstance(test_method, types.FunctionType)):
+          setattr(class_object, name, _multi_worker_test(test_method))
+      return combination_decorator(class_object)
+    else:
+      return combination_decorator(_multi_worker_test(test_method_or_class))
+
+  return decorator
+
+
+combine = combinations_lib.combine
+times = combinations_lib.times
+NamedObject = combinations_lib.NamedObject
+
+
+# Identifies whether we're in the main process or worker processes.
+# `_multi_worker_test` decoration behaves differently in the main processs and
+# the worker processes. See the documentation of _multi_worker_test for detail.
+_running_in_worker = False
+
+
+def in_main_process():
+  """Whether it's in the main test process.
+
+  This is normally used to prepare the test environment which should only happen
+  in the main process.
+
+  Returns:
+    A boolean.
+  """
+  return not _running_in_worker
+
+
+class TestEnvironment(object):
+
+  def __init__(self):
+    self.tf_data_service_dispatcher = None
+
+  def __setattr__(self, name, value):
+    if not in_main_process():
+      raise ValueError(
+          "combinations.env() should only be modified in the main process. "
+          "Condition your code on combinations.in_main_process().")
+    super().__setattr__(name, value)
+
+
+_env = TestEnvironment()
+
+
+def env():
+  """Returns the object holds the test environment information.
+
+  Tests should modifies this in the main process if needed, and it will be
+  passed to the worker processes each time a test case is ran.
+
+  Returns:
+    a TestEnvironment object.
+  """
+  return _env
+
+
+_TestResult = collections.namedtuple("_TestResult", ["status", "message"])
+
+
+def _test_runner(test_id, test_env):
+  """Executes the test with the given test_id.
+
+  This is a simple wrapper around TestRunner to be used with
+  multi_process_runner. Similar to test.main(), but it executes only one test
+  specified by test_id and returns whether the test succeeds. If the test fails,
+  the function prints failures and errors to stdout.
+
+  Args:
+    test_id: TestCase.id()
+    test_env: a TestEnvironment object.
+
+  Returns:
+    A boolean indicates whether the test succeeds.
+  """
+  global _running_in_worker, _env
+  # No need to restore the value of _running_in_worker since it should always be
+  # True in worker processes.
+  _running_in_worker = True
+  _env = test_env
+  test = unittest.defaultTestLoader.loadTestsFromName(test_id)
+  runner = unittest.TextTestRunner()
+  result = runner.run(test)
+  # Treat expected failures as failures, so that the main process can get
+  # them and fail as expected. Also treat errors as failures to simplify the
+  # handling.
+  failures = result.failures + result.expectedFailures + result.errors
+  if failures:
+    ret = _TestResult(status="failure", message=failures[0][1])
+  elif result.skipped:
+    ret = _TestResult(status="skipped", message=result.skipped[0][1])
+  else:
+    # Treat unexpectedSuccesses as OK so that the test case in the main process
+    # succeed as well.
+    ret = _TestResult(status="ok", message=None)
+  # Print tracebacks to stdout and multi_process_runner will collect
+  # them and stream back to the main process.
+  if ret.message:
+    print(ret.message)
+  return ret
+
+
+def _multi_worker_test(test_method):
+  """Decorate test_method so that it runs in each worker.
+
+  We use `multi_process_runner` to simulate multiple workers. Since we run the
+  this function in the main process and all worker processes, this decoration
+  behaves differently in the main process and worker procssses. In the main
+  process, it spawns subprocesses and runs the test on each of them; in a worker
+  process, it executes test in the same way as a normal test, e.g.
+  setUp()/tearDown() are called before/after the test.
+
+  Args:
+    test_method: a function which must be a test method.
+
+  Returns:
+    Decorated `test_method`. Note that the decorated function has additional
+    arguments.
+  """
+
+  def decorator(self, has_chief, num_workers, runner, **kwargs):
+    if _num_total_workers(has_chief, num_workers) == 1 or _running_in_worker:
+      # We're in worker process or the test is for single worker. Either case we
+      # execute the test method directly instead of spawning subprocesses.
+
+      # For MultiWorkerMirroredStrategy(CollectiveAllReduceStrategy), install a
+      # session that connects to the local server. This is necessary for multi
+      # worker graph mode tests to work. Those tests cannot use their graphs or
+      # sessions, including the one returned by self.cached_session(). Since
+      # existing tests may already be doing so, we only install the session for
+      # multi worker tests.
+      with _multi_worker_session(kwargs):
+        test_method(self, **kwargs)
+      return
+
+    # We're in the main process. We spawn subprocesses and run the *test* on
+    # each of them. Note that we're not directly executing test_method passed to
+    # _multi_worker_test, because we need setUp()/tearDown() to be called and
+    # all the decorations on the test method. The conceptual call stack is:
+    #   [main process]test.main()
+    #     [main process]test_runner.run(test)
+    #       [main process]wrapper by combinations.generate()
+    #         [main process]_multi_worker_test.decorator()
+    #           # A sub process goes through the same code path as the main
+    #           # process.
+    #           [sub process]_test_runner()
+    #             [sub process]test_runner.run(test)
+    #               [sub process]wrapper by combinations.generate()
+    #                 [sub process]_multi_worker_test.decorator()
+    #                   # _running_in_worker is True
+    #                   [sub process]test_method()
+    test_id = self.id()
+    if runner:
+      results = runner.run(_test_runner, args=(test_id, _env))
+    else:
+      cluster_spec = multi_worker_test_base.create_cluster_spec(
+          has_chief=has_chief,
+          num_workers=num_workers,
+          num_ps=0,
+          has_eval=False)
+      results = multi_process_runner.run(
+          _test_runner, cluster_spec, args=(test_id, _env)).return_value
+
+    skip_reason = None
+    for result in results:
+      if result.status == "failure":
+        # We can't tell which worker the return value come from, so we fail on
+        # the  first error.
+        self.fail(result.message)
+        break
+      elif result.status == "skipped":
+        # Record the skip reason, but do not actually skip the test in case some
+        # processes fail instead.
+        skip_reason = result.message
+    if skip_reason is not None:
+      self.skipTest(skip_reason)
+
+  argspec = tf_inspect.getfullargspec(test_method)
+  decorator_args = (argspec.args or []) + ["has_chief", "num_workers", "runner"]
+  decorator_argspec = argspec._replace(args=decorator_args)
+  return tf_decorator.make_decorator(
+      test_method, decorator, decorator_argspec=decorator_argspec)
+
+
+def _num_total_workers(has_chief, num_workers):
+  """Returns the number of workers including the chief."""
+  if has_chief:
+    return num_workers + 1
+  return num_workers
+
+
+def _multi_worker_session(kwargs):
+  """Returns a context manager that enters a session that is configured for the MultiWorkerMirroredStrategy.
+
+  Args:
+    kwargs: a dict. Keyword arguments passed to the test.
+
+  Returns:
+    A context manager. If MultiWorkerMirroredStrategy is the  one and only one
+    strategy in kwargs and it's in graph mode, it's the seesion that is
+    configured for that strategy.  Otherwise, it's a no-op context manager.
+  """
+  strategy = None
+  for _, v in kwargs.items():
+    if isinstance(v, distribute_lib.StrategyBase):
+      if strategy is not None:
+        logging.warning(
+            "The test uses multiple strategies. Skipping "
+            "entering a session that is configured for the strategy.")
+        return ops.NullContextmanager()
+      strategy = v
+  if context.executing_eagerly() or not isinstance(
+      strategy, collective_all_reduce_strategy.CollectiveAllReduceStrategy):
+    return ops.NullContextmanager()
+  sess_config = copy.deepcopy(context.context().config)
+  sess_config = strategy.update_config_proto(sess_config)
+  target = strategy.cluster_resolver.master()
+  return session.Session(config=sess_config, target=target).as_default()

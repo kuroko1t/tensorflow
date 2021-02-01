@@ -19,6 +19,7 @@ limitations under the License.
 #include <vector>
 
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/protobuf/config.pb.h"
 #include "tensorflow/core/util/command_line_flags.h"
 
 namespace tensorflow {
@@ -38,6 +39,12 @@ struct XlaAutoJitFlag {
   int32 optimization_level_general;
 };
 
+// Sets the xla_auto_jit_flag based on the given flag string. Supported syntax
+// is:
+// <number>: sets general and single_gpu setting to the provided number.
+// single-gpu(<number>): sets the single_gpu setting to the provided number.
+bool SetXlaAutoJitFlagFromFlagString(const string& value);
+
 // Flags associated with the XLA bridge's mark_for_compilation_pass module.
 struct MarkForCompilationPassFlags {
   XlaAutoJitFlag xla_auto_jit_flag;
@@ -48,6 +55,9 @@ struct MarkForCompilationPassFlags {
 
   // Maximum number of operators in an XLA compilation.
   int32 tf_xla_max_cluster_size;
+
+  // If non-empty, limit XLA clustering to the following TF operations.
+  string tf_xla_ops_to_cluster;
 
   // Dump graphs during XLA compilation.
   bool tf_xla_clustering_debug;
@@ -63,6 +73,12 @@ struct MarkForCompilationPassFlags {
   // we do not do deadness related safety checks.  This is unsound in general,
   // but can be used as a debugging aid.
   bool tf_xla_disable_deadness_safety_checks_for_debugging;
+
+  // If tf_xla_disable_resource_variable_safety_checks_for_debugging is set to
+  // true then we do not do safety checks to preserve TensorFlow's resource
+  // variable concurrency semantics.  This is unsound in general, but can be
+  // used as a debugging aid.
+  bool tf_xla_disable_resource_variable_safety_checks_for_debugging;
 };
 
 // Flags associated with the XLA bridge's xla_device module.
@@ -72,6 +88,9 @@ struct XlaDeviceFlags {
   // Enabling this mode by a legacy flag is a temporary mechanism. When this
   // feature is battle-tested, we will switch this to be a session option.
   bool tf_xla_compile_on_demand;
+
+  // Enables "XLA" devices if this flag is set.
+  bool tf_xla_enable_xla_devices;
 };
 
 // Flags common to the _Xla* ops and their kernels.
@@ -90,6 +109,18 @@ struct BuildXlaOpsPassFlags {
   // If true then insert Print nodes to print out values produced by XLA
   // clusters.  Useful for debugging.
   bool tf_xla_print_cluster_outputs;
+
+  // If true, insert CheckNumerics nodes for every floating point typed input to
+  // an XLA cluster.
+  bool tf_xla_check_cluster_input_numerics;
+
+  // If true, insert CheckNumerics nodes for every floating point typed output
+  // from an XLA cluster.
+  bool tf_xla_check_cluster_output_numerics;
+
+  // Disables all constant folding. The primary use for this is for testing to
+  // guarantee that tests are run on XLA and not on TF's CPU implementation.
+  bool tf_xla_disable_constant_folding;
 };
 
 // Flags for the IntroduceFloatingPointJitter pass.
@@ -103,6 +134,11 @@ struct IntroduceFloatingPointJitterPassFlags {
   std::vector<string> tensor_names;
 };
 
+// Flags for common MLIR configurations.
+struct MlirCommonFlags {
+  ConfigProto::Experimental::MlirBridgeRollout tf_mlir_enable_mlir_bridge;
+};
+
 // Return a pointer to the DumpGraphFlags struct;
 // repeated calls return the same pointer.
 // This should be called only after Flags::Parse() has returned.
@@ -111,12 +147,14 @@ struct IntroduceFloatingPointJitterPassFlags {
 // parses TF_XLA_FLAGS for all of them.  Those functions which return a pointer
 // always return the same pointer.
 MarkForCompilationPassFlags* GetMarkForCompilationPassFlags();
-const BuildXlaOpsPassFlags& GetBuildXlaOpsPassFlags();
+BuildXlaOpsPassFlags* GetBuildXlaOpsPassFlags();
 XlaDeviceFlags* GetXlaDeviceFlags();
 const XlaOpsCommonFlags& GetXlaOpsCommonFlags();
 
 const IntroduceFloatingPointJitterPassFlags&
 GetIntroduceFloatingPointJitterPassFlags();
+
+MlirCommonFlags* GetMlirCommonFlags();
 
 // Appends the flag definitions associated with
 // MarkForCompilationPassFlags/DumpGraphFlags to `flag_list`.
@@ -124,6 +162,14 @@ GetIntroduceFloatingPointJitterPassFlags();
 // Has the side-effect of parsing TF_XLA_FLAGS if that hasn't happened yet.
 void AppendMarkForCompilationPassFlags(
     std::vector<tensorflow::Flag>* flag_list);
+
+// Disables XLA compilation, forces it to return an error message instead. Can
+// be used by a server to ensure that JIT compilation is opt-in.
+void DisableXlaCompilation();
+
+// Returns `false` unless `DisableXlaCompilation` was called.
+bool FailOnXlaCompilation();
+
 }  // namespace tensorflow
 
 #endif  // TENSORFLOW_COMPILER_JIT_FLAGS_H_

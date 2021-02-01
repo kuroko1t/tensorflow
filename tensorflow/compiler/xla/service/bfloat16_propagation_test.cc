@@ -211,7 +211,8 @@ TEST_F(BFloat16PropagationTest, DoNotChangeAllReduce) {
   HloInstruction* all_reduce =
       builder.AddInstruction(HloInstruction::CreateAllReduce(
           ShapeUtil::MakeTupleShape({shape, shape}), {a, b}, reduction,
-          /*replica_groups=*/{}, /*barrier=*/"", /*all_reduce_id=*/1));
+          /*replica_groups=*/{}, /*constrain_layout=*/false,
+          /*channel_id=*/1, /*use_global_device_ids=*/false));
   HloInstruction* gte0 = builder.AddInstruction(
       HloInstruction::CreateGetTupleElement(shape, all_reduce, 0));
   HloInstruction* gte1 = builder.AddInstruction(
@@ -420,6 +421,35 @@ TEST_F(BFloat16PropagationTest, PropagateThroughFusion) {
   EXPECT_TRUE(OutputsBF16(b_f0));
   EXPECT_TRUE(OutputsBF16(a_f1));
   EXPECT_TRUE(OutputsBF16(b_f1));
+}
+
+// Tests that a fusion with a bitcast-convert as its root is changed via adding
+// extra convert, instead of changing the type in-place.
+TEST_F(BFloat16PropagationTest, FusionWithBitcastConvertRoot) {
+  auto module = CreateNewVerifiedModule();
+  auto builder = HloComputation::Builder(TestName());
+  Shape u32_shape = ShapeUtil::MakeShape(U32, {4, 4});
+  Shape f32_shape = ShapeUtil::MakeShape(F32, {4, 4});
+
+  HloInstruction* param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, u32_shape, "param"));
+
+  auto builder_f = HloComputation::Builder("fusion");
+  HloInstruction* a_f = builder_f.AddInstruction(
+      HloInstruction::CreateParameter(0, u32_shape, "a"));
+  HloInstruction* bc_f = builder_f.AddInstruction(
+      HloInstruction::CreateBitcastConvert(f32_shape, a_f));
+  auto comp_f = module->AddEmbeddedComputation(builder_f.Build());
+  auto fusion = builder.AddInstruction(HloInstruction::CreateFusion(
+      f32_shape, HloInstruction::FusionKind::kLoop, {param}, comp_f));
+  auto dot = builder.AddInstruction(CreateDot(f32_shape, fusion, fusion));
+
+  auto computation = module->AddEntryComputation(builder.Build());
+  EXPECT_TRUE(PropagatePrecision(module.get()));
+
+  EXPECT_EQ(computation->root_instruction(), dot);
+  EXPECT_EQ(bc_f->shape(), f32_shape);
+  EXPECT_TRUE(OutputsBF16(bc_f));
 }
 
 // Tests that changes to BF16 that cannot be propagated outside a fusion are
@@ -1014,6 +1044,225 @@ TEST_F(BFloat16PropagationTest, TupleDomainNoPropagation) {
   EXPECT_FALSE(OutputsBF16(b_gte));
   EXPECT_FALSE(OutputsBF16(domain));
   EXPECT_FALSE(OutputsBF16(param));
+}
+
+TEST_F(BFloat16PropagationTest, ConditionalSeparateBranchOperands) {
+  const string module_str = R"(
+HloModule module
+
+true_branch {
+  true_param = f32[4096,4096] parameter(0)
+  ROOT max = f32[4096,4096] maximum(true_param, true_param)
+}
+
+false_branch {
+  false_param = f32[4096,4096] parameter(0)
+  ROOT add = f32[4096,4096] add(false_param, false_param)
+}
+
+ENTRY entry {
+  param0 = f32[4096,4096] parameter(0)
+  param1 = f32[4096,4096] parameter(1)
+  copy0 = f32[4096,4096] copy(param0)
+  copy1 = f32[4096,4096] copy(param1)
+  param2 = pred[] parameter(2)
+  conditional = f32[4096,4096] conditional(param2, copy0, copy1),
+    true_computation=true_branch, false_computation=false_branch
+  ROOT dot = f32[4096,4096] dot(conditional, conditional),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+)";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(module_str));
+  EXPECT_TRUE(PropagatePrecision(module.get()));
+
+  auto cond = FindInstruction(module.get(), "conditional");
+  auto copy0 = FindInstruction(module.get(), "copy0");
+  auto copy1 = FindInstruction(module.get(), "copy1");
+  EXPECT_TRUE(OutputsBF16(cond));
+  EXPECT_TRUE(OutputsBF16(copy0));
+  EXPECT_FALSE(OutputsBF16(copy1));
+}
+
+TEST_F(BFloat16PropagationTest, ConditionalSharedBranchOperands) {
+  const string module_str = R"(
+HloModule module
+
+true_branch {
+  true_param = f32[4096,4096] parameter(0)
+  ROOT max = f32[4096,4096] maximum(true_param, true_param)
+}
+
+false_branch {
+  false_param = f32[4096,4096] parameter(0)
+  ROOT add = f32[4096,4096] add(false_param, false_param)
+}
+
+ENTRY entry {
+  param0 = f32[4096,4096] parameter(0)
+  copy0 = f32[4096,4096] copy(param0)
+  param1 = pred[] parameter(1)
+  conditional = f32[4096,4096] conditional(param1, copy0, copy0),
+    true_computation=true_branch, false_computation=false_branch
+  ROOT dot = f32[4096,4096] dot(conditional, conditional),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+)";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(module_str));
+  EXPECT_TRUE(PropagatePrecision(module.get()));
+
+  auto cond = FindInstruction(module.get(), "conditional");
+  auto copy0 = FindInstruction(module.get(), "copy0");
+  EXPECT_TRUE(OutputsBF16(cond));
+  EXPECT_FALSE(OutputsBF16(copy0));
+}
+
+TEST_F(BFloat16PropagationTest, ConditionalAliasingOutputs) {
+  const string module_str = R"(
+HloModule module
+
+true_branch {
+  true_param = f32[4096,4096] parameter(0)
+  max = f32[4096,4096] maximum(true_param, true_param)
+  ROOT true_tuple = (f32[4096,4096], f32[4096,4096]) tuple(max, max)
+}
+
+false_branch {
+  false_param = f32[4096,4096] parameter(0)
+  min = f32[4096,4096] minimum(false_param, false_param)
+  max2 = f32[4096,4096] maximum(false_param, false_param)
+  ROOT false_tuple = (f32[4096,4096], f32[4096,4096]) tuple(min, max2)
+}
+
+ENTRY entry {
+  param0 = f32[4096,4096] parameter(0)
+  copy0 = f32[4096,4096] copy(param0)
+  param1 = pred[] parameter(1)
+  conditional = (f32[4096,4096], f32[4096,4096]) conditional(param1, copy0, copy0),
+    true_computation=true_branch, false_computation=false_branch
+  gte0 = f32[4096,4096] get-tuple-element(conditional), index=0
+  gte1 = f32[4096,4096] get-tuple-element(conditional), index=1
+  dot = f32[4096,4096] dot(gte0, gte1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  ROOT tuple = (f32[4096,4096], f32[4096,4096]) tuple(dot, gte1)
+}
+)";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(module_str));
+  EXPECT_FALSE(PropagatePrecision(module.get()));
+}
+
+TEST_F(BFloat16PropagationTest, DynamicUpdateSlice) {
+  // This test is crafted so that the DUS has an f32 input (due to parameter)
+  // and bf16 output (due to dot). But we should enforce DUS operand 0 and
+  // output to get the same precision since it's an in-place operation.
+  const string module_str = R"(
+HloModule Module
+
+ENTRY main {
+  param = f32[128,128] parameter(0)
+  constant.1 = f32[] constant(0)
+  broadcast.6 = f32[128,1] broadcast(constant.1), dimensions={}
+  constant.3 = s32[] constant(0)
+  dynamic-update-slice = f32[128,128] dynamic-update-slice(param, broadcast.6, constant.3, constant.3)
+  ROOT dot = f32[128,128] dot(dynamic-update-slice, dynamic-update-slice), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+)";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(module_str));
+  EXPECT_FALSE(PropagatePrecision(module.get()));
+
+  HloInstruction* dus = module->entry_computation()->GetInstructionWithName(
+      "dynamic-update-slice");
+  EXPECT_FALSE(OutputsBF16(dus));
+}
+
+// This test demonstrates the need for invoking the ResolveAliasingBuffer
+// multiple times via a fixed-point algorithm. The key was the aliasing of the
+// two output buffers of the conditional, at subshape 0 (first element). This
+// aliasing is not resolved until after the gte0 variale is already processed,
+// triggering incorrect type for gte0 if not repeating the aliasing analysis.
+TEST_F(BFloat16PropagationTest, ConditionalGTEWithFusion) {
+  const string module_str = R"(
+HloModule module
+
+%add.0 (x: f32[4096,4096], y: f32[4096,4096]) -> f32[4096,4096] {
+  x.1 = f32[4096,4096] parameter(0)
+  y.1 = f32[4096,4096] parameter(1)
+  ROOT dot1 = f32[4096,4096] dot(x.1, y.1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+%add.1 (x: f32[4096,4096], y: f32[4096,4096]) -> f32[4096,4096] {
+  x.1 = f32[4096,4096] parameter(0)
+  y.1 = f32[4096,4096] parameter(1)
+  ROOT dot1 = f32[4096,4096] dot(x.1, y.1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+%add.2 (x: f32[4096,4096], y: f32[4096,4096]) -> f32[4096,4096] {
+  x.1 = f32[4096,4096] parameter(0)
+  y.1 = f32[4096,4096] parameter(1)
+  ROOT dot1 = f32[4096,4096] dot(x.1, y.1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+%add.3 (x: f32[4096,4096], y: f32[4096,4096]) -> f32[4096,4096] {
+  x.1 = f32[4096,4096] parameter(0)
+  y.1 = f32[4096,4096] parameter(1)
+  ROOT dot1 = f32[4096,4096] dot(x.1, y.1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+true_branch {
+  true_param = f32[4096,4096] parameter(0)
+  constant.1 = f32[4096,4096] constant(0)
+  add0 = f32[4096,4096] fusion(true_param,true_param), kind=kLoop, calls=add.0
+  constant.2 = f32[4096,4096] constant(0)
+  ROOT tuple.2 = (f32[4096,4096], f32[4096,4096], f32[]) tuple(true_param,add0,constant.2)
+}
+
+false_branch {
+  false_param = f32[4096,4096] parameter(0)
+  add3 = f32[4096,4096] fusion(false_param,false_param), kind=kLoop, calls=add.1
+  constant.1 = f32[4096,4096] constant(0)
+  ROOT tuple.2 = (f32[4096,4096], f32[4096,4096], f32[]) tuple(add3, add3,constant.1)
+}
+
+ENTRY entry {
+  param0 = f32[4096,4096] parameter(0)
+  copy0 = f32[4096,4096] copy(param0)
+  param1 = pred[] parameter(1)
+  conditional = (f32[4096,4096], f32[4096,4096], f32[4096,4096]) conditional(param1, param0, copy0),
+    true_computation=true_branch, false_computation=false_branch
+  gte = f32[4096,4096] get-tuple-element(conditional), index=0
+  gte1 = f32[4096,4096] get-tuple-element(conditional), index=1
+  gte2 = f32[4096,4096] get-tuple-element(conditional), index=2
+  add2 = f32[4096,4096] fusion(gte, gte1), kind=kLoop, calls=add.2
+  ROOT add3 = f32[4096,4096] fusion(add2, gte2), kind=kLoop, calls=add.3
+  }
+)";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(module_str));
+  EXPECT_TRUE(PropagatePrecision(module.get()));
+  VLOG(2) << module->ToString() << "\n";
+  EXPECT_TRUE(HloVerifier(/*layout_sensitive=*/false,
+                          /*allow_mixed_precision=*/true)
+                  .Run(module.get())
+                  .status()
+                  .ok());
+  auto gte = FindInstruction(module.get(), "gte");
+  auto gte1 = FindInstruction(module.get(), "gte1");
+  auto gte2 = FindInstruction(module.get(), "gte2");
+  EXPECT_FALSE(OutputsBF16(gte));
+  EXPECT_FALSE(OutputsBF16(gte1));
+  EXPECT_TRUE(OutputsBF16(gte2));
 }
 
 }  // namespace xla

@@ -13,14 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 #include "tensorflow/core/kernels/cwise_ops_gpu_common.cu.h"
 
 namespace tensorflow {
 namespace functor {
-DEFINE_BINARY6(sub, Eigen::half, float, double, int64, complex64, complex128);
+DEFINE_BINARY9(sub, Eigen::half, float, double, int64, complex64, complex128,
+               uint8, uint16, uint32);
+DEFINE_BINARY1(sub, uint64);
 }  // namespace functor
 }  // namespace tensorflow
 
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM

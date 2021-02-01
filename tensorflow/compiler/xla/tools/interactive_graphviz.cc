@@ -38,21 +38,26 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/local_service.h"
 #include "tensorflow/compiler/xla/service/platform_util.h"
 #include "tensorflow/compiler/xla/tools/hlo_extractor.h"
-#include "tensorflow/core/lib/core/error_codes.pb.h"
 #include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/subprocess.h"
+#include "tensorflow/core/protobuf/error_codes.pb.h"
 #include "tensorflow/core/util/command_line_flags.h"
 #if defined(PLATFORM_GOOGLE)
 #include "util/readline/readline.h"
+#endif
+
+#if defined(PLATFORM_WINDOWS)
+#include <io.h>
+#define isatty _isatty
 #endif
 
 namespace xla {
 namespace tools {
 namespace {
 
-bool ReadLine(const char *prompt, string *line) {
+bool ReadLine(const char* prompt, string* line) {
 #if defined(PLATFORM_GOOGLE)
   return util::ReadLine(prompt, line);
 #else
@@ -67,6 +72,7 @@ bool ReadLine(const char *prompt, string *line) {
 struct Options {
   string hlo_snapshot;
   string hlo_proto;
+  string hlo_module_proto;
   string hlo_text;
   string platform;
   string browser;
@@ -107,8 +113,7 @@ constexpr int64 kDefaultMaxNumNodesInAllPaths = 100;
 
 using absl::EqualsIgnoreCase;
 
-// A global control for whether backend configuration display is enabled.
-bool show_backend_config = true;
+HloRenderOptions hlo_render_options;
 
 HloInstruction* FindInstruction(const HloModule& module, string node_name) {
   if (absl::StartsWith(node_name, "%")) {
@@ -155,6 +160,8 @@ void DoHelpCommand() {
     Renders all nodes in <computation>.
   backend_config [on|off]
     Controls whether backend operation configuration information is printed.
+  show_fusion_subcomputations [on|off]
+    Controls whether fusion subcomputations are shown.
   list [name|op_name|op_type] <pattern>
     Lists all instructions whose name, metadata op_name, or metadata op_type
     contains <pattern> as a substring.
@@ -168,22 +175,41 @@ void DoHelpCommand() {
     <height> is specified, the new computation contains nodes up to <height>
     nodes above the root.
   help
-    Prints this usage information.)"
+    Prints this usage information.
+  quit
+    Exit the application.)"
             << std::endl;
 }
 
 // Turn metadata-printing on or off.
 void DoBackendConfigCommand(const std::vector<string>& tokens) {
   if (tokens.size() == 2 && tokens[1] == "on") {
-    show_backend_config = true;
+    hlo_render_options.show_backend_config = true;
   } else if (tokens.size() == 2 && tokens[1] == "off") {
-    show_backend_config = false;
+    hlo_render_options.show_backend_config = false;
   } else if (tokens.size() != 1) {
     std::cerr << "(Illegal backend_config value.  Use either 'on' or 'off'.)"
               << std::endl;
   }
   std::cout << "Backend configuration display "
-            << (show_backend_config ? "ON" : "OFF") << std::endl;
+            << (hlo_render_options.show_backend_config ? "ON" : "OFF")
+            << std::endl;
+}
+
+// Turn fusion computation display on or off.
+void DoShowFusionSubcomputationsCommand(const std::vector<string>& tokens) {
+  if (tokens.size() == 2 && tokens[1] == "on") {
+    hlo_render_options.show_fusion_subcomputations = true;
+  } else if (tokens.size() == 2 && tokens[1] == "off") {
+    hlo_render_options.show_fusion_subcomputations = false;
+  } else if (tokens.size() != 1) {
+    std::cerr << "(Illegal show_fusion_subcomputations value.  Use either "
+                 "'on' or 'off'.)"
+              << std::endl;
+  }
+  std::cout << "Fusion subcomputations display "
+            << (hlo_render_options.show_fusion_subcomputations ? "ON" : "OFF")
+            << std::endl;
 }
 
 // List all computations in the module.
@@ -366,7 +392,7 @@ void DoExtractCommand(const HloModule& module,
   auto extracted_module = ExtractModule(instr, height);
   std::cout << extracted_module->ToString(
                    HloPrintOptions::ShortParsable().set_print_backend_config(
-                       show_backend_config))
+                       hlo_render_options.show_backend_config))
             << std::endl;
 }
 
@@ -510,7 +536,7 @@ void DoAllPathsCommand(const Options& opts, const HloModule& module,
   }
   RenderAndDisplayGraph(opts, [&](RenderedGraphFormat format) {
     return RenderAllPathsFromTo(*from, *to, max_nodes, format,
-                                /*show_backend_config=*/show_backend_config);
+                                hlo_render_options);
   });
 }
 
@@ -575,15 +601,13 @@ void DoPlotCommand(const Options& opts, const HloModule& module,
     RenderAndDisplayGraph(opts, [&](RenderedGraphFormat format) {
       return RenderGraph(*comp, /*label=*/"",
                          comp->parent()->config().debug_options(), format,
-                         /*hlo_execution_profile=*/nullptr,
-                         /*show_backend_config=*/show_backend_config);
+                         /*hlo_execution_profile=*/nullptr, hlo_render_options);
     });
   } else {
     RenderAndDisplayGraph(opts, [&](RenderedGraphFormat format) {
-      return RenderNeighborhoodAround(
-          *instr, graph_width, format,
-          /*show_backend_config=*/show_backend_config,
-          /*boundary=*/boundary);
+      return RenderNeighborhoodAround(*instr, graph_width, format,
+                                      hlo_render_options,
+                                      /*boundary=*/boundary);
     });
   }
 }
@@ -610,6 +634,8 @@ void InteractiveDumpGraphs(const Options& opts, const HloModule& module) {
       DoHelpCommand();
     } else if (tokens[0] == "backend_config") {
       DoBackendConfigCommand(tokens);
+    } else if (tokens[0] == "show_fusion_subcomputations") {
+      DoShowFusionSubcomputationsCommand(tokens);
     } else if (tokens[0] == "list") {
       if (tokens.size() > 1 && tokens[1] == "computations") {
         DoListComputationsCommand(module, tokens);
@@ -628,28 +654,25 @@ void InteractiveDumpGraphs(const Options& opts, const HloModule& module) {
   }
 }
 
-void CheckFlags(const Options &opts) {
-  std::vector<string> nonempty_proto_flags;
+void CheckFlags(const Options& opts) {
+  int nonempty_flags_amount = 0;
   if (!opts.hlo_proto.empty()) {
-    nonempty_proto_flags.push_back("--hlo_proto");
+    ++nonempty_flags_amount;
   }
   if (!opts.hlo_snapshot.empty()) {
-    nonempty_proto_flags.push_back("--hlo_snapshot");
+    ++nonempty_flags_amount;
   }
   if (!opts.hlo_text.empty()) {
-    nonempty_proto_flags.push_back("--hlo_text");
+    ++nonempty_flags_amount;
   }
-  switch (nonempty_proto_flags.size()) {
-    case 1:
-      // We're good to go.
-      break;
-    case 0:
-      LOG(FATAL) << "Need one of the following options: "
-                 << absl::StrJoin(nonempty_proto_flags, ", ");
-    default:
-      LOG(FATAL) << "Can only specify one of "
-                 << absl::StrJoin(nonempty_proto_flags, ", ");
+  if (!opts.hlo_module_proto.empty()) {
+    ++nonempty_flags_amount;
   }
+  if (nonempty_flags_amount == 1) {
+    return;
+  }
+  LOG(FATAL) << "Can only specify one and only one of '--hlo_proto', "
+                "'--hlo_snapshot', '--hlo_text', '--hlo_module_proto' flags.";
 }
 
 void RealMain(const Options& opts) {
@@ -681,6 +704,10 @@ void RealMain(const Options& opts) {
   } else if (!opts.hlo_text.empty()) {
     module = HloRunner::ReadModuleFromHloTextFile(
                  opts.hlo_text, xla::GetDebugOptionsFromFlags())
+                 .ValueOrDie();
+  } else if (!opts.hlo_module_proto.empty()) {
+    module = HloRunner::ReadModuleFromModuleBinaryProtofile(
+                 opts.hlo_module_proto, xla::GetDebugOptionsFromFlags())
                  .ValueOrDie();
   }
 
@@ -720,14 +747,15 @@ int main(int argc, char** argv) {
                        "HloSnapshot proto to interactively dump to graphviz"),
       tensorflow::Flag("hlo_proto", &opts.hlo_proto,
                        "XLA hlo proto to interactively dump to graphviz"),
+      tensorflow::Flag("hlo_module_proto", &opts.hlo_module_proto,
+                       "XLA hlomodule proto to interactively dump to graphviz"),
       tensorflow::Flag("hlo_text", &opts.hlo_text,
                        "XLA hlo proto to interactively dump to graphviz"),
       tensorflow::Flag("platform", &opts.platform,
                        "Platform to compile for: CPU, CUDA, etc"),
       tensorflow::Flag("browser", &opts.browser,
                        "Path to web browser used to display produced graphs."),
-      tensorflow::Flag("help", &need_help,
-                       "Prints this help message"),
+      tensorflow::Flag("help", &need_help, "Prints this help message"),
   };
   xla::string usage = tensorflow::Flags::Usage(argv[0], flag_list);
   bool parse_ok = tensorflow::Flags::Parse(&argc, argv, flag_list);

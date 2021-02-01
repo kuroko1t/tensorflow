@@ -70,7 +70,7 @@ static float ExpectedCountHelper(float p, int batch_size, int num_tries) {
     return p * batch_size;
   }
   // numerically stable version of (1 - (1-p)^num_tries)
-  return -expm1(num_tries * std::log1p(-p));
+  return -std::expm1(num_tries * std::log1p(-p));
 }
 
 }  // namespace
@@ -84,7 +84,7 @@ void RangeSampler::SampleBatchGetExpectedCountAvoid(
   int num_tries;
 
   if (unique) {
-    CHECK_LE(batch_size + avoided_values.size(), range_);
+    CHECK_LE(static_cast<int64>(batch_size + avoided_values.size()), range_);
     std::unordered_set<int64> used(batch_size);
     used.insert(avoided_values.begin(), avoided_values.end());
     int num_picked = 0;
@@ -160,9 +160,11 @@ LogUniformSampler::LogUniformSampler(int64 range)
 int64 LogUniformSampler::Sample(random::SimplePhilox* rnd) const {
   const int64 value =
       static_cast<int64>(exp(rnd->RandDouble() * log_range_)) - 1;
-  CHECK_GE(value, 0);
+  DCHECK_GE(value, 0);
   // Mathematically, value should be <= range_, but might not be due to some
-  // floating point roundoff, so we mod by range_.
+  // floating point roundoff, so we mod by range_.  In practice this case
+  // happens never regardless of the value of range_, including and up to
+  // DBL_MAX.  But we include it as a guarantee of the function's output.
   return value % range_;
 }
 

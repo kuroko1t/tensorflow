@@ -17,7 +17,9 @@ limitations under the License.
 #define TENSORFLOW_CORE_TPU_TPU_EMBEDDING_OPTIMIZATION_PARAMETERS_UTILS_H_
 
 #include <string>
+
 #include "absl/base/casts.h"
+#include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/protobuf/tpu/optimization_parameters.pb.h"
 
@@ -39,9 +41,6 @@ enum class GradientAccumulationSupport {
   // Accumulation cannot be used with this optimizer.
   kNotSupported,
 
-  // Accumulation is unnecessary because optimizer application is commutative.
-  kUnnecessary,
-
   // Accumulation is allowed and changes optimizer behavior.
   kSupported,
 };
@@ -49,18 +48,19 @@ enum class GradientAccumulationSupport {
 // Returns the number of optimization parameter vectors used by the optimization
 // algorithm, excluding the weights themselves and assuming no gradient
 // accumulation.
-Status GetBaseAuxiliaryParameterCount(OptimizationAlgorithm alg, int *count);
+Status GetBaseAuxiliaryParameterCount(const OptimizationParameters &params,
+                                      int *count);
 
 // Returns whether (and how) an optimization algorithm supports gradient
 // accumulation.
-Status GetGradientAccumulationSupport(OptimizationAlgorithm alg,
+Status GetGradientAccumulationSupport(const OptimizationParameters &params,
                                       GradientAccumulationSupport *support);
 
 // Returns the parameter specifications for the optimization algorithm (the main
 // parameters first, followed by any auxiliary parameters such as Adagrad
 // accumulators).
 Status GetOptimizationAlgorithmStateVariables(
-    OptimizationAlgorithm alg, bool use_gradient_accumulation,
+    const OptimizationParameters &params, bool use_gradient_accumulation,
     std::vector<StateVariableSpecification> *state_variables);
 
 // Maximum value of auxiliar_parameter_count for any optimization algorithm.
@@ -82,7 +82,23 @@ static constexpr int kMaxAuxiliaryParameterCount = 3;
 // not no-ops on zero gradients, so we need to distinguish an accumulated
 // gradient of zero from one that has been cleared after its gradients have
 // already been applied to the parameters and accumulators.
-const float kGradientAccumulatorInitialValue = absl::bit_cast<float, uint32>(1);
+inline float GradientAccumulatorInitialValue() {
+  return absl::bit_cast<float, uint32>(1);
+}
+
+// Generic shape function for per-optimization-algorithm load ops.
+class LoadOpShapeFunction {
+ public:
+  // Computes resulting shape and does parameter checking.
+  Status operator()(shape_inference::InferenceContext *c) const;
+};
+
+// Generic shape function for per-optimization-algorithm retrieve ops.
+class RetrieveOpShapeFunction {
+ public:
+  // Computes resulting shape and does parameter checking.
+  Status operator()(shape_inference::InferenceContext *c) const;
+};
 
 }  // namespace tpu
 }  // namespace tensorflow

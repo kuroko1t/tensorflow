@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <utility>
 
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "tensorflow/core/distributed_runtime/call_options.h"
 #include "tensorflow/core/distributed_runtime/master_interface.h"
 #include "tensorflow/core/distributed_runtime/rpc/grpc_master_service_impl.h"
@@ -26,6 +28,7 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/tracing.h"
+#include "tensorflow/core/profiler/lib/traceme.h"
 #include "tensorflow/core/protobuf/master.pb.h"
 
 namespace tensorflow {
@@ -110,11 +113,12 @@ class GrpcRemoteMaster : public MasterInterface {
 
  private:
   // Start tracing, attaching a unique ID to both the trace and the RPC.
-  tracing::ScopedActivity* NewTraceRpc(StringPiece name,
-                                       ::grpc::ClientContext* ctx) {
+  profiler::TraceMe* NewTraceRpc(StringPiece name, ::grpc::ClientContext* ctx) {
     string trace_id = strings::StrCat(tracing::GetUniqueArg());
     ctx->AddMetadata(GrpcIdKey(), trace_id);
-    return new tracing::ScopedActivity(name, trace_id);
+    return new profiler::TraceMe(
+        [&] { return strings::StrCat(name, ":", trace_id); },
+        profiler::TraceMeLevel::kInfo);
   }
 
   template <typename Request, typename Response>
@@ -123,20 +127,20 @@ class GrpcRemoteMaster : public MasterInterface {
                        ::grpc::Status (MasterServiceStub::*pfunc)(
                            ::grpc::ClientContext*, const Request&, Response*),
                        string trace_string = {}) {
-    int64 timeout_in_ms = call_options->GetTimeout();
-    int64 expired_time_micros = Env::Default()->NowMicros();
-    if (timeout_in_ms > 0) {
-      expired_time_micros += (timeout_in_ms / 1000.);
+    absl::Duration timeout = absl::Milliseconds(call_options->GetTimeout());
+    absl::Time expired_time = absl::FromUnixMicros(Env::Default()->NowMicros());
+    if (timeout > absl::ZeroDuration()) {
+      expired_time += timeout;
     }
     Status s;
     for (int num_retries = 0;; ++num_retries) {
       ::grpc::ClientContext ctx;
-      std::unique_ptr<tracing::ScopedActivity> trace;
+      std::unique_ptr<profiler::TraceMe> trace;
       if (!trace_string.empty()) {
         trace.reset(NewTraceRpc(trace_string, &ctx));
       }
       ctx.set_fail_fast(false);
-      if (timeout_in_ms > 0) {
+      if (timeout > absl::ZeroDuration()) {
         // We do not modify the timeout here to match legacy behavior. However,
         // this could violate the contract of tensorflow::Session. If we retry
         // an RPC just before the deadline is exceeded, we will still set the
@@ -144,7 +148,7 @@ class GrpcRemoteMaster : public MasterInterface {
         // being double what was expected.
         // TODO(b/117162170): investigate fixing this behavior for legacy and
         // gRPC RPC layers.
-        ctx.set_deadline(gpr_time_from_millis(timeout_in_ms, GPR_TIMESPAN));
+        ctx.set_deadline(absl::ToChronoTime(absl::Now() + timeout));
       }
       s = FromGrpcStatus((stub_.get()->*pfunc)(&ctx, *request, response));
       if (!errors::IsUnavailable(s)) {
@@ -159,20 +163,20 @@ class GrpcRemoteMaster : public MasterInterface {
         LOG(WARNING) << "Too many retries, returning last status: " << s;
         return s;
       }
-      const int64 now_micros = Env::Default()->NowMicros();
-      const int64 deadline_with_backoff_micros =
-          now_micros + ComputeBackoffMicroseconds(num_retries);
+      absl::Time now = absl::FromUnixMicros(Env::Default()->NowMicros());
+      const absl::Time deadline_with_backoff =
+          now + absl::Microseconds(ComputeBackoffMicroseconds(num_retries));
       // Wait for a short period of time before retrying the RPC.  If our
       // backoff would put us past the RPC deadline, we truncate it to ensure
       // our RPC starts before the deadline.
-      const auto backoff_until =
-          (timeout_in_ms <= 0 ||
-           expired_time_micros > deadline_with_backoff_micros)
-              ? deadline_with_backoff_micros
-              : expired_time_micros;
-      Env::Default()->SleepForMicroseconds(backoff_until - now_micros);
-      if (Env::Default()->NowMicros() > expired_time_micros &&
-          timeout_in_ms > 0) {
+      const auto backoff_until = (timeout <= absl::ZeroDuration() ||
+                                  expired_time > deadline_with_backoff)
+                                     ? deadline_with_backoff
+                                     : expired_time;
+      Env::Default()->SleepForMicroseconds(
+          absl::ToInt64Microseconds(backoff_until - now));
+      now = absl::FromUnixMicros(Env::Default()->NowMicros());
+      if (now > expired_time && timeout > absl::ZeroDuration()) {
         // If timeout_in_ms is set, exit the retry loop on timeout.
         return errors::DeadlineExceeded(ctx.debug_error_string());
       }

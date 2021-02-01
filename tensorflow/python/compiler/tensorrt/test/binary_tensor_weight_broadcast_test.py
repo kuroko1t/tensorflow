@@ -18,59 +18,56 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 import numpy as np
 
 from tensorflow.python.compiler.tensorrt.test import tf_trt_integration_test_base as trt_test
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import ops
-from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_array_ops
 from tensorflow.python.platform import test
 
 
 class BinaryTensorWeightBroadcastTest(trt_test.TfTrtIntegrationTestBase):
+  """Tests for scale & elementwise layers in TF-TRT."""
 
   def _ConstOp(self, shape):
     return constant_op.constant(np.random.randn(*shape), dtype=dtypes.float32)
 
+  def GraphFn(self, x):
+    for weights_shape in [
+        (1,),  # scale
+        (24, 1, 1),  # scale
+        (24, 24, 20),  # scale
+        (20,),  # elementwise
+        (1, 24, 1, 1),  # elementwise
+        (1, 24, 24, 1),  # elementwise
+        (1, 24, 24, 20),  # elementwise
+        (24, 20),  # elementwise
+    ]:
+      a = self._ConstOp(weights_shape)
+      f = x + a
+      x = self.trt_incompatible_op(f)
+      a = self._ConstOp(weights_shape)
+      f = a + x
+      x = self.trt_incompatible_op(f)
+    return gen_array_ops.reshape(x, [5, -1], name="output_0")
+
   def GetParams(self):
-    """Tests for scale & elementwise layers in TF-TRT."""
-    input_name = "input"
-    input_dims = [10, 24, 24, 20]
-    output_name = "output"
-    g = ops.Graph()
-    with g.as_default():
-      x = array_ops.placeholder(
-          dtype=dtypes.float32, shape=input_dims, name=input_name)
-      for weights_shape in [
-          (1,),  # scale
-          (24, 1, 1),  # scale
-          (24, 24, 20),  # scale
-          (20,),  # elementwise
-          (1, 24, 1, 1),  # elementwise
-          (1, 24, 24, 1),  # elementwise
-          (1, 24, 24, 20),  # elementwise
-          (24, 20),  # elementwise
-      ]:
-        a = self._ConstOp(weights_shape)
-        f = x + a
-        x = self.trt_incompatible_op(f)
-        a = self._ConstOp(weights_shape)
-        f = a + x
-        x = self.trt_incompatible_op(f)
-      gen_array_ops.reshape(x, [5, -1], name=output_name)
-    return trt_test.TfTrtIntegrationTestParams(
-        gdef=g.as_graph_def(),
-        input_names=[input_name],
-        input_dims=[[input_dims]],
-        output_names=[output_name],
-        expected_output_dims=[[[5, 23040]]])
+    # TODO(aaroey): test graph with different dtypes.
+    return self.BuildParams(self.GraphFn, dtypes.float32, [[10, 24, 24, 20]],
+                            [[5, 23040]])
 
   def ExpectedEnginesToBuild(self, run_params):
     """Return the expected engines to build."""
     return ["TRTEngineOp_%d" % i for i in range(16)]
 
+  # TODO(b/176540862): remove this routine to disallow native segment execution
+  # for TensorRT 7+.
+  def setUp(self):
+    super(trt_test.TfTrtIntegrationTestBase, self).setUp()
+    if trt_test.IsTensorRTVersionGreaterEqual(7):
+      os.environ["TF_TRT_ALLOW_ENGINE_NATIVE_SEGMENT_EXECUTION"] = "True"
 
 if __name__ == "__main__":
   test.main()

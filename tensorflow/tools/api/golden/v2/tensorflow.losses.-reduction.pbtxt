@@ -3,6 +3,10 @@ tf_class {
   is_instance: "<class \'tensorflow.python.keras.utils.losses_utils.ReductionV2\'>"
   is_instance: "<type \'object\'>"
   member {
+    name: "AUTO"
+    mtype: "<type \'str\'>"
+  }
+  member {
     name: "NONE"
     mtype: "<type \'str\'>"
   }

@@ -1,146 +1,201 @@
 # Android quickstart
 
-An example Android application using TensorFLow Lite is available
-[on GitHub](https://github.com/tensorflow/tensorflow/tree/master/tensorflow/lite/java/demo).
-The demo is a sample camera app that classifies images continuously
-using either a quantized Mobilenet model or a floating point Inception-v3 model.
-To run the demo, a device running Android 5.0 ( API 21) or higher is required.
+To get started with TensorFlow Lite on Android, we recommend exploring the
+following example.
 
-In the demo app, inference is done using the TensorFlow Lite Java API. The demo
-app classifies frames in real-time, displaying the top most probable
-classifications. It also displays the time taken to detect the object.
+<a class="button button-primary" href="https://github.com/tensorflow/examples/tree/master/lite/examples/image_classification/android">Android
+image classification example</a>
 
-There are three ways to get the demo app to your device:
+Read
+[TensorFlow Lite Android image classification](https://github.com/tensorflow/examples/blob/master/lite/examples/image_classification/android/EXPLORE_THE_CODE.md)
+for an explanation of the source code.
 
-* Download the [prebuilt binary APK](http://download.tensorflow.org/deps/tflite/TfLiteCameraDemo.apk).
-* Use Android Studio to build the application.
-* Download the source code for TensorFlow Lite and the demo and build it using
-  bazel.
+This example app uses
+[image classification](https://www.tensorflow.org/lite/models/image_classification/overview)
+to continuously classify whatever it sees from the device's rear-facing camera.
+The application can run either on device or emulator.
 
+Inference is performed using the TensorFlow Lite Java API and the
+[TensorFlow Lite Android Support Library](../inference_with_metadata/lite_support.md).
+The demo app classifies frames in real-time, displaying the top most probable
+classifications. It allows the user to choose between a floating point or
+[quantized](https://www.tensorflow.org/lite/performance/post_training_quantization)
+model, select the thread count, and decide whether to run on CPU, GPU, or via
+[NNAPI](https://developer.android.com/ndk/guides/neuralnetworks).
 
-## Download the pre-built binary
+Note: Additional Android applications demonstrating TensorFlow Lite in a variety
+of use cases are available in
+[Examples](https://www.tensorflow.org/lite/examples).
 
-The easiest way to try the demo is to download the
-[pre-built binary APK](https://storage.googleapis.com/download.tensorflow.org/deps/tflite/TfLiteCameraDemo.apk)
+## Build in Android Studio
 
-Once the APK is installed, click the app icon to start the program. The first
-time the app is opened, it asks for runtime permissions to access the device
-camera. The demo app opens the back-camera of the device and recognizes objects
-in the camera's field of view. At the bottom of the image (or at the left
-of the image if the device is in landscape mode), it displays top three objects
-classified and the classification latency.
+To build the example in Android Studio, follow the instructions in
+[README.md](https://github.com/tensorflow/examples/blob/master/lite/examples/image_classification/android/README.md).
 
+## Create your own Android app
 
-## Build in Android Studio with TensorFlow Lite AAR from JCenter
+To get started quickly writing your own Android code, we recommend using our
+[Android image classification example](https://github.com/tensorflow/examples/tree/master/lite/examples/image_classification/android)
+as a starting point.
 
-Use Android Studio to try out changes in the project code and compile the demo
-app:
+The following sections contain some useful information for working with
+TensorFlow Lite on Android.
 
-* Install the latest version of
-  [Android Studio](https://developer.android.com/studio/index.html).
-* Make sure the Android SDK version is greater than 26 and NDK version is greater
-  than 14 (in the Android Studio settings).
-* Import the `tensorflow/lite/java/demo` directory as a new
-  Android Studio project.
-* Install all the Gradle extensions it requests.
+### Use Android Studio ML Model Binding
 
-Now you can build and run the demo app. 
+Note: Required [Android Studio 4.1](https://developer.android.com/studio) or
+above
 
-The build process downloads the quantized [Mobilenet TensorFlow Lite model](https://storage.googleapis.com/download.tensorflow.org/models/tflite/mobilenet_v1_224_android_quant_2017_11_08.zip), and unzips it into the assets directory: `tensorflow/lite/java/demo/app/src/main/assets/`.
+To import a TensorFlow Lite (TFLite) model:
 
-Some additional details are available on the
-[TF Lite Android App page](https://github.com/tensorflow/tensorflow/tree/master/tensorflow/lite/java/demo/README.md).
+1.  Right-click on the module you would like to use the TFLite model or click on
+    `File`, then `New` > `Other` > `TensorFlow Lite Model`
+    ![Right-click menus to access the TensorFlow Lite import functionality](../images/android/right_click_menu.png)
 
-### Using other models
+1.  Select the location of your TFLite file. Note that the tooling will
+    configure the module's dependency on your behalf with ML Model binding and
+    all dependencies automatically inserted into your Android module's
+    `build.gradle` file.
 
-To use a different model:
-* Download the floating point [Inception-v3 model](https://storage.googleapis.com/download.tensorflow.org/models/tflite/inception_v3_slim_2016_android_2017_11_10.zip).
-* Unzip and copy `inceptionv3_non_slim_2015.tflite` to the assets directory. 
-* Change the chosen classifier in [Camera2BasicFragment.java](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/java/demo/app/src/main/java/com/example/android/tflitecamerademo/Camera2BasicFragment.java)<br>
-  from: `classifier = new ImageClassifierQuantizedMobileNet(getActivity());`<br>
-  to: `classifier = new ImageClassifierFloatInception(getActivity());`.
+    Optional: Select the second checkbox for importing TensorFlow GPU if you
+    want to use [GPU acceleration](../performance/gpu).
+    ![Import dialog for TFLite model](../images/android/import_dialog.png)
 
+1.  Click `Finish`.
 
-## Build TensorFlow Lite and the demo app from source
+1.  The following screen will appear after the import is successful. To start
+    using the model, select Kotlin or Java, copy and paste the code under the
+    `Sample Code` section. You can get back to this screen by double clicking
+    the TFLite model under the `ml` directory in Android Studio.
+    ![Model details page in Android Studio](../images/android/model_details.png)
 
-### Clone the TensorFlow repo
+### Use the TensorFlow Lite Task Library
+
+TensorFlow Lite Task Library contains a set of powerful and easy-to-use
+task-specific libraries for app developers to create ML experiences with TFLite.
+It provides optimized out-of-box model interfaces for popular machine learning
+tasks, such as image classification, question and answer, etc. The model
+interfaces are specifically designed for each task to achieve the best
+performance and usability. Task Library works cross-platform and is supported on
+Java, C++, and Swift (coming soon).
+
+To use the Support Library in your Android app, we recommend using the AAR
+hosted at JCenter for
+[Task Vision library](https://bintray.com/google/tensorflow/tensorflow-lite-task-vision)
+and
+[Task Text library](https://bintray.com/google/tensorflow/tensorflow-lite-task-text)
+, respectively.
+
+You can specify this in your `build.gradle` dependencies as follows:
+
+```build
+dependencies {
+    implementation 'org.tensorflow:tensorflow-lite-task-vision:0.1.0'
+    implementation 'org.tensorflow:tensorflow-lite-task-text:0.1.0'
+}
+```
+
+See the introduction in the
+[TensorFlow Lite Task Library overview](../inference_with_metadata/task_library/overview.md)
+for more details.
+
+### Use the TensorFlow Lite Android Support Library
+
+The TensorFlow Lite Android Support Library makes it easier to integrate models
+into your application. It provides high-level APIs that help transform raw input
+data into the form required by the model, and interpret the model's output,
+reducing the amount of boilerplate code required.
+
+It supports common data formats for inputs and outputs, including images and
+arrays. It also provides pre- and post-processing units that perform tasks such
+as image resizing and cropping.
+
+To use the Support Library in your Android app, we recommend using the
+[TensorFlow Lite Support Library AAR hosted at JCenter](https://bintray.com/google/tensorflow/tensorflow-lite-support).
+
+You can specify this in your `build.gradle` dependencies as follows:
+
+```build
+dependencies {
+    implementation 'org.tensorflow:tensorflow-lite-support:0.1.0'
+}
+```
+
+To get started, follow the instructions in the
+[TensorFlow Lite Android Support Library](../inference_with_metadata/lite_support.md).
+
+### Use the TensorFlow Lite AAR from JCenter
+
+To use TensorFlow Lite in your Android app, we recommend using the
+[TensorFlow Lite AAR hosted at JCenter](https://bintray.com/google/tensorflow/tensorflow-lite).
+
+You can specify this in your `build.gradle` dependencies as follows:
+
+```build
+dependencies {
+    implementation 'org.tensorflow:tensorflow-lite:0.0.0-nightly-SNAPSHOT'
+}
+```
+
+This AAR includes binaries for all of the
+[Android ABIs](https://developer.android.com/ndk/guides/abis). You can reduce
+the size of your application's binary by only including the ABIs you need to
+support.
+
+We recommend most developers omit the `x86`, `x86_64`, and `arm32` ABIs. This
+can be achieved with the following Gradle configuration, which specifically
+includes only `armeabi-v7a` and `arm64-v8a`, which should cover most modern
+Android devices.
+
+```build
+android {
+    defaultConfig {
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a'
+        }
+    }
+}
+```
+
+To learn more about `abiFilters`, see
+[`NdkOptions`](https://google.github.io/android-gradle-dsl/current/com.android.build.gradle.internal.dsl.NdkOptions.html)
+in the Android Gradle documentation.
+
+## Build Android app using C++
+
+There are two ways to use TFLite through C++ if you build your app with the NDK:
+
+### Use TFLite C API
+
+This is the *recommended* approach. Download the
+[TensorFlow Lite AAR hosted at JCenter](https://bintray.com/google/tensorflow/tensorflow-lite),
+rename it to `tensorflow-lite-*.zip`, and unzip it. You must include the four
+header files in `headers/tensorflow/lite/` and `headers/tensorflow/lite/c/`
+folder and the relevant `libtensorflowlite_jni.so` dynamic library in `jni/`
+folder in your NDK project.
+
+The `c_api.h` header file contains basic documentation about using the TFLite C
+API.
+
+### Use TFLite C++ API
+
+If you want to use TFLite through C++ API, you can build the C++ shared
+libraries:
+
+32bit armeabi-v7a:
 
 ```sh
-git clone https://github.com/tensorflow/tensorflow
+bazel build -c opt --config=android_arm //tensorflow/lite:libtensorflowlite.so
 ```
 
-### Install Bazel
+64bit arm64-v8a:
 
-If `bazel` is not installed on your system, see
-[Installing Bazel](https://bazel.build/versions/master/docs/install.html).
-
-Note: Bazel does not currently support Android builds on Windows. Windows users
-should download the
-[prebuilt binary](https://storage.googleapis.com/download.tensorflow.org/deps/tflite/TfLiteCameraDemo.apk).
-
-### Install Android NDK and SDK
-
-The Android NDK is required to build the native (C/C++) TensorFlow Lite code. The
-current recommended version is *14b* and can be found on the
-[NDK Archives](https://developer.android.com/ndk/downloads/older_releases.html#ndk-14b-downloads)
-page.
-
-The Android SDK and build tools can be
-[downloaded separately](https://developer.android.com/tools/revisions/build-tools.html)
-or used as part of
-[Android Studio](https://developer.android.com/studio/index.html). To build the
-TensorFlow Lite Android demo, build tools require API >= 23 (but it will run on
-devices with API >= 21).
-
-In the root of the TensorFlow repository, update the `WORKSPACE` file with the
-`api_level` and location of the SDK and NDK. If you installed it with
-Android Studio, the SDK path can be found in the SDK manager. The default NDK
-path is:`{SDK path}/ndk-bundle.` For example:
-
-```
-android_sdk_repository (
-    name = "androidsdk",
-    api_level = 23,
-    build_tools_version = "23.0.2",
-    path = "/home/xxxx/android-sdk-linux/",
-)
-
-android_ndk_repository(
-    name = "androidndk",
-    path = "/home/xxxx/android-ndk-r10e/",
-    api_level = 19,
-)
+```sh
+bazel build -c opt --config=android_arm64 //tensorflow/lite:libtensorflowlite.so
 ```
 
-Some additional details are available on the
-[TF Lite Android App page](https://github.com/tensorflow/tensorflow/tree/master/tensorflow/lite/java/demo/README.md).
-
-### Build the source code
-
-To build the demo app, run `bazel`:
-
-```
-bazel build --cxxopt=--std=c++11 //tensorflow/lite/java/demo/app/src/main:TfLiteCameraDemo
-```
-
-Caution: Because of an bazel bug, we only support building the Android demo app
-within a Python 2 environment.
-
-
-## About the demo
-
-The demo app is resizing each camera image frame (224 width * 224 height) to
-match the quantized MobileNets model (299 * 299 for Inception-v3). The resized
-image is converted—row by row—into a
-[ByteBuffer](https://developer.android.com/reference/java/nio/ByteBuffer.html).
-Its size is  1 * 224 * 224 * 3 bytes, where 1 is the number of images in a batch.
-224 * 224 (299 * 299) is the width and height of the image. 3 bytes represents
-the 3 colors of a pixel.
-
-This demo uses the TensorFlow Lite Java inference API
-for models which take a single input and provide a single output. This outputs a
-two-dimensional array, with the first dimension being the category index and the
-second dimension being the confidence of classification. Both models have 1001
-unique categories and the app sorts the probabilities of all the categories and
-displays the top three. The model file must be downloaded and bundled within the
-assets directory of the app.
+Currently, there is no straightforward way to extract all header files needed,
+so you must include all header files in `tensorflow/lite/` from the TensorFlow
+repository. Additionally, you will need header files from
+[FlatBuffers](https://github.com/google/flatbuffers) and
+[Abseil](https://github.com/abseil/abseil-cpp).
